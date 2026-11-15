@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">NICH Employee Attendance 3</string>
+    <string name="send_email_and_finish">Send Email &amp; Finish</string>
+    <string name="dispatching_email_and_finishing">Sending Email &amp; Finishing...</string>
+</resources>

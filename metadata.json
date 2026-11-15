@@ -1,0 +1,6 @@
+{
+  "name": "NICH Employee Attendance 3",
+  "description": "Enterprise biometric employee attendance terminal with live facial recognition scanning, auto-retry, passcode fallback verification, and automated check-in/check-out logging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,162 @@
+{
+  "entities": {
+    "Employee": {
+      "title": "Employee",
+      "description": "Enrolled employee profile for biometric facial recognition and passcode fallback verification.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated terminal operator UID owning this directory record."
+        },
+        "employeeCode": {
+          "type": "string",
+          "description": "Human-readable corporate employee identifier (e.g., NICH-1042)."
+        },
+        "name": {
+          "type": "string",
+          "description": "Full name of the employee."
+        },
+        "department": {
+          "type": "string",
+          "description": "Assigned organizational department."
+        },
+        "roleTitle": {
+          "type": "string",
+          "description": "Job title or security clearance role."
+        },
+        "passcode": {
+          "type": "string",
+          "description": "Unique employee passcode verified against the database during fallback."
+        },
+        "checkInCode": {
+          "type": "string",
+          "description": "Optional dedicated code (e.g. 147) that forces CHECK_IN verification."
+        },
+        "checkOutCode": {
+          "type": "string",
+          "description": "Optional dedicated code (e.g. 369) that forces CHECK_OUT verification."
+        },
+        "avatarKey": {
+          "type": "string",
+          "description": "Bundled or profile avatar identifier."
+        },
+        "faceSignature": {
+          "type": "string",
+          "description": "Encoded facial landmark geometric ratio vector captured during enrollment."
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "Whether this employee is currently active for attendance check-in/out."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set via FieldValue.serverTimestamp() at creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set via FieldValue.serverTimestamp() at update."
+        }
+      },
+      "required": [
+        "userId",
+        "employeeCode",
+        "name",
+        "department",
+        "roleTitle",
+        "passcode",
+        "checkInCode",
+        "checkOutCode",
+        "avatarKey",
+        "faceSignature",
+        "isActive",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AttendanceLog": {
+      "title": "AttendanceLog",
+      "description": "Immutable biometric or passcode-verified employee attendance event.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated terminal operator UID owning this log."
+        },
+        "employeeId": {
+          "type": "string",
+          "description": "Document ID of the verified employee."
+        },
+        "employeeCode": {
+          "type": "string",
+          "description": "Corporate employee ID code."
+        },
+        "employeeName": {
+          "type": "string",
+          "description": "Verified employee full name."
+        },
+        "department": {
+          "type": "string",
+          "description": "Verified employee department."
+        },
+        "avatarKey": {
+          "type": "string",
+          "description": "Employee avatar identifier."
+        },
+        "eventType": {
+          "type": "string",
+          "enum": ["CHECK_IN", "CHECK_OUT"],
+          "description": "Automated time-based attendance classification."
+        },
+        "verificationMethod": {
+          "type": "string",
+          "enum": ["FACE_SCAN_1", "FACE_SCAN_2", "PASSCODE"],
+          "description": "Verification method that succeeded."
+        },
+        "confidenceScore": {
+          "type": "integer",
+          "description": "Match confidence percentage (0 to 100)."
+        },
+        "loggedTimeLabel": {
+          "type": "string",
+          "description": "Formatted local time label when attendance was logged."
+        },
+        "loggedDateKey": {
+          "type": "string",
+          "description": "ISO date key (yyyy-MM-dd) for daily filtering."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp set via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "employeeId",
+        "employeeCode",
+        "employeeName",
+        "department",
+        "avatarKey",
+        "eventType",
+        "verificationMethod",
+        "confidenceScore",
+        "loggedTimeLabel",
+        "loggedDateKey",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/employees/{employeeId}": {
+      "schema": { "$ref": "#/entities/Employee" },
+      "description": "Enrolled employee directory scoped to the authenticated terminal operator."
+    },
+    "/users/{userId}/attendanceLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AttendanceLog" },
+      "description": "Append-only attendance event logs scoped to the authenticated terminal operator."
+    }
+  }
+}

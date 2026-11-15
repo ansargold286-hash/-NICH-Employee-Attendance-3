@@ -1,0 +1,113 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidEmployee(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.employeeCode is string && data.employeeCode.size() >= 2 && data.employeeCode.size() <= 32 &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+             data.department is string && data.department.size() >= 1 && data.department.size() <= 80 &&
+             data.roleTitle is string && data.roleTitle.size() >= 1 && data.roleTitle.size() <= 80 &&
+             data.passcode is string && data.passcode.size() >= 3 && data.passcode.size() <= 12 &&
+             data.checkInCode is string && data.checkInCode.size() <= 12 &&
+             data.checkOutCode is string && data.checkOutCode.size() <= 12 &&
+             data.avatarKey is string && data.avatarKey.size() >= 1 && data.avatarKey.size() <= 64 &&
+             data.faceSignature is string && data.faceSignature.size() <= 512 &&
+             data.isActive is bool &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidAttendanceLog(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             isValidId(data.employeeId) &&
+             data.employeeCode is string && data.employeeCode.size() >= 2 && data.employeeCode.size() <= 32 &&
+             data.employeeName is string && data.employeeName.size() >= 1 && data.employeeName.size() <= 80 &&
+             data.department is string && data.department.size() >= 1 && data.department.size() <= 80 &&
+             data.avatarKey is string && data.avatarKey.size() >= 1 && data.avatarKey.size() <= 64 &&
+             (data.eventType == 'CHECK_IN' || data.eventType == 'CHECK_OUT') &&
+             (data.verificationMethod == 'FACE_SCAN_1' || data.verificationMethod == 'FACE_SCAN_2' || data.verificationMethod == 'PASSCODE') &&
+             data.confidenceScore is int && data.confidenceScore >= 0 && data.confidenceScore <= 100 &&
+             data.loggedTimeLabel is string && data.loggedTimeLabel.size() >= 1 && data.loggedTimeLabel.size() <= 32 &&
+             data.loggedDateKey is string && data.loggedDateKey.size() >= 8 && data.loggedDateKey.size() <= 16 &&
+             data.createdAt is timestamp && data.createdAt <= request.time;
+    }
+
+    match /users/{userId}/employees/{employeeId} {
+      allow get: if isSignedIn() && request.auth.uid == userId && isValidId(employeeId);
+      allow list: if isSignedIn() && request.auth.uid == userId;
+
+      allow create: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       isValidId(employeeId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'employeeCode', 'name', 'department', 'roleTitle',
+                         'passcode', 'checkInCode', 'checkOutCode', 'avatarKey',
+                         'faceSignature', 'isActive', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'employeeCode', 'name', 'department', 'roleTitle',
+                         'passcode', 'checkInCode', 'checkOutCode', 'avatarKey',
+                         'faceSignature', 'isActive', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidEmployee(incoming(), userId);
+
+      allow update: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       isValidId(employeeId) &&
+                       isValidEmployee(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'employeeCode', 'name', 'department', 'roleTitle',
+                         'passcode', 'checkInCode', 'checkOutCode', 'avatarKey',
+                         'faceSignature', 'isActive', 'updatedAt'
+                       ]);
+
+      allow delete: if isSignedIn() && request.auth.uid == userId && isValidId(employeeId);
+    }
+
+    match /users/{userId}/attendanceLogs/{logId} {
+      allow get: if isSignedIn() && request.auth.uid == userId && isValidId(logId);
+      allow list: if isSignedIn() && request.auth.uid == userId;
+
+      allow create: if isSignedIn() &&
+                       request.auth.uid == userId &&
+                       isValidId(logId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'employeeId', 'employeeCode', 'employeeName',
+                         'department', 'avatarKey', 'eventType', 'verificationMethod',
+                         'confidenceScore', 'loggedTimeLabel', 'loggedDateKey', 'createdAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'employeeId', 'employeeCode', 'employeeName',
+                         'department', 'avatarKey', 'eventType', 'verificationMethod',
+                         'confidenceScore', 'loggedTimeLabel', 'loggedDateKey', 'createdAt'
+                       ]) &&
+                       isValidAttendanceLog(incoming(), userId) &&
+                       exists(/databases/$(database)/documents/users/$(userId)/employees/$(incoming().employeeId));
+
+      allow update, delete: if false;
+    }
+  }
+}
