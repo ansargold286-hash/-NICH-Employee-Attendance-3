@@ -265,9 +265,9 @@ fun BiometricCameraScanner(
                                             val frontCam = isFrontCameraRef.get()
                                             val rotationDeg = imageProxy.imageInfo.rotationDegrees
 
-                                            if (stepSnapshot == LivenessDirection.CENTER_VERIFY) {
+                                            if (stepSnapshot == LivenessDirection.CENTER_VERIFY || lastSelfiePathRef.get() == null) {
                                                 val nowMs = System.currentTimeMillis()
-                                                if (nowMs - lastSelfieWriteMs.get() >= 450L) {
+                                                if (lastSelfiePathRef.get() == null || nowMs - lastSelfieWriteMs.get() >= 250L) {
                                                     val capturedPath = captureRotatedSelfieFile(
                                                         context = appContext,
                                                         imageProxy = imageProxy,
@@ -282,11 +282,7 @@ fun BiometricCameraScanner(
                                             }
 
                                             val inputImage = InputImage.fromMediaImage(mediaImage, rotationDeg)
-                                            val selfieForFrame = if (stepSnapshot == LivenessDirection.CENTER_VERIFY) {
-                                                lastSelfiePathRef.get()
-                                            } else {
-                                                null
-                                            }
+                                            val selfieForFrame = lastSelfiePathRef.get()
 
                                             faceDetector.process(inputImage)
                                                 .addOnSuccessListener { faces ->
@@ -832,83 +828,39 @@ internal fun analyzeFaceBiometrics(
         )
     }
 
-    val headPoseAligned = abs(yaw) <= 20f && abs(pitch) <= 20f && abs(roll) <= 18f
+    val headPoseAligned = abs(yaw) <= 45f && abs(pitch) <= 45f && abs(roll) <= 40f
 
-    if (!eyesLocked || !noseMustacheLocked) {
-        return FaceAnalysisFrame(
-            faceDetected = true,
-            eyesLocked = eyesLocked,
-            noseMustacheLocked = false,
-            jawBeardLocked = jawBeardLocked,
-            signature = null,
-            livenessOpenEyes = livenessOpenEyes,
-            headPoseAligned = headPoseAligned,
-            headYawDeg = yaw,
-            headPitchDeg = pitch,
-            headRollDeg = roll,
-            isFrontCamera = isFrontCamera,
-            qualityIssue = "Center eyes, nose, and mouth inside reticle"
-        )
-    }
+    // Flexible partial-landmark fallback: synthesize geometric anchor ratios if some landmarks are occluded
+    val defaultEyeY = box.top + boxH * 0.36f
+    val lEyeX = leftEye?.x ?: (box.left + boxW * 0.32f)
+    val lEyeY = leftEye?.y ?: defaultEyeY
+    val rEyeX = rightEye?.x ?: (box.left + boxW * 0.68f)
+    val rEyeY = rightEye?.y ?: defaultEyeY
+    val noseX = nose?.x ?: (box.left + boxW * 0.50f)
+    val noseY = nose?.y ?: (box.top + boxH * 0.56f)
+    val mLeftX = mouthLeft?.x ?: (box.left + boxW * 0.34f)
+    val mLeftY = mouthLeft?.y ?: (box.top + boxH * 0.74f)
+    val mRightX = mouthRight?.x ?: (box.left + boxW * 0.66f)
+    val mRightY = mouthRight?.y ?: (box.top + boxH * 0.74f)
 
-    if (!headPoseAligned) {
-        return FaceAnalysisFrame(
-            faceDetected = true,
-            eyesLocked = true,
-            noseMustacheLocked = true,
-            jawBeardLocked = jawBeardLocked,
-            signature = null,
-            livenessOpenEyes = livenessOpenEyes,
-            headPoseAligned = false,
-            headYawDeg = yaw,
-            headPitchDeg = pitch,
-            headRollDeg = roll,
-            isFrontCamera = isFrontCamera,
-            qualityIssue = "Look straight into camera lens for selfie match"
-        )
-    }
+    val eyeDist = hypot(rEyeX - lEyeX, rEyeY - lEyeY).coerceAtLeast(1f)
+    val eyeMidX = (lEyeX + rEyeX) / 2f
+    val eyeMidY = (lEyeY + rEyeY) / 2f
 
-    if (!livenessOpenEyes) {
-        return FaceAnalysisFrame(
-            faceDetected = true,
-            eyesLocked = false,
-            noseMustacheLocked = true,
-            jawBeardLocked = jawBeardLocked,
-            signature = null,
-            livenessOpenEyes = false,
-            headPoseAligned = true,
-            headYawDeg = yaw,
-            headPitchDeg = pitch,
-            headRollDeg = roll,
-            isFrontCamera = isFrontCamera,
-            qualityIssue = "Keep both eyes open for verification"
-        )
-    }
-
-    val lEye = leftEye!!
-    val rEye = rightEye!!
-    val nosePos = nose!!
-    val mLeft = mouthLeft!!
-    val mRight = mouthRight!!
-
-    val eyeDist = hypot(rEye.x - lEye.x, rEye.y - lEye.y).coerceAtLeast(1f)
-    val eyeMidX = (lEye.x + rEye.x) / 2f
-    val eyeMidY = (lEye.y + rEye.y) / 2f
-
-    val mouthDist = hypot(mRight.x - mLeft.x, mRight.y - mLeft.y)
-    val noseDrop = hypot(nosePos.x - eyeMidX, nosePos.y - eyeMidY)
+    val mouthDist = hypot(mRightX - mLeftX, mRightY - mLeftY)
+    val noseDrop = hypot(noseX - eyeMidX, noseY - eyeMidY)
 
     val upperLipMid = if (upperLipContour.isNotEmpty()) {
         upperLipContour[upperLipContour.size / 2]
     } else {
         null
     }
-    val mouthCenterX = (mLeft.x + mRight.x) / 2f
-    val mouthCenterY = (mLeft.y + mRight.y) / 2f
+    val mouthCenterX = (mLeftX + mRightX) / 2f
+    val mouthCenterY = (mLeftY + mRightY) / 2f
     val philtrumDist = if (upperLipMid != null) {
-        hypot(upperLipMid.x - nosePos.x, upperLipMid.y - nosePos.y)
+        hypot(upperLipMid.x - noseX, upperLipMid.y - noseY)
     } else {
-        hypot(mouthCenterX - nosePos.x, mouthCenterY - nosePos.y)
+        hypot(mouthCenterX - noseX, mouthCenterY - noseY)
     }
 
     val chinPoint = if (faceContour.size >= 19) {
@@ -941,8 +893,8 @@ internal fun analyzeFaceBiometrics(
         else -> 0.72f
     }
 
-    val noseToLeftEye = hypot(nosePos.x - lEye.x, nosePos.y - lEye.y).coerceAtLeast(1f)
-    val noseToRightEye = hypot(nosePos.x - rEye.x, nosePos.y - rEye.y).coerceAtLeast(1f)
+    val noseToLeftEye = hypot(noseX - lEyeX, noseY - lEyeY).coerceAtLeast(1f)
+    val noseToRightEye = hypot(noseX - rEyeX, noseY - rEyeY).coerceAtLeast(1f)
     val symmetryRatio = (minOf(noseToLeftEye, noseToRightEye) / maxOf(noseToLeftEye, noseToRightEye))
         .coerceIn(0.5f, 1.0f)
 
@@ -959,12 +911,12 @@ internal fun analyzeFaceBiometrics(
 
     return FaceAnalysisFrame(
         faceDetected = true,
-        eyesLocked = true,
-        noseMustacheLocked = true,
-        jawBeardLocked = true,
+        eyesLocked = eyesLocked,
+        noseMustacheLocked = noseMustacheLocked,
+        jawBeardLocked = jawBeardLocked,
         signature = signature,
-        livenessOpenEyes = true,
-        headPoseAligned = true,
+        livenessOpenEyes = livenessOpenEyes,
+        headPoseAligned = headPoseAligned,
         headYawDeg = yaw,
         headPitchDeg = pitch,
         headRollDeg = roll,

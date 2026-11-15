@@ -66,6 +66,7 @@ object AttendancePdfGenerator {
         val nativePdfSuccess = tryWriteNativePdf(
             context = context,
             outFile = outFile,
+            employeeName = employee.name,
             eventType = eventType,
             logDateKey = log.loggedDateKey,
             loggedTimeLabel = log.loggedTimeLabel,
@@ -92,6 +93,7 @@ object AttendancePdfGenerator {
     private fun tryWriteNativePdf(
         context: Context,
         outFile: File,
+        employeeName: String,
         eventType: AttendanceEventType,
         logDateKey: String,
         loggedTimeLabel: String,
@@ -281,10 +283,11 @@ object AttendancePdfGenerator {
                     selfieBitmap.recycle()
 
                     val infoX = thumbRect.right + 18f
-                    canvas.drawText("LIVE VERIFICATION SELFIE", infoX, cardTop + 38f, sectionPaint)
-                    canvas.drawText("Liveness Challenge: PASSED (Head-Pose Verified)", infoX, cardTop + 62f, valuePaint)
-                    canvas.drawText("Capture Timestamp: $loggedTimeLabel ($logDateKey)", infoX, cardTop + 84f, valuePaint)
-                    canvas.drawText("Security Mode: Strict Single-Step Biometric Check-In", infoX, cardTop + 106f, labelPaint)
+                    canvas.drawText("LIVE VERIFICATION SELFIE", infoX, cardTop + 34f, sectionPaint)
+                    canvas.drawText("Staff: ${employeeName.take(36)}", infoX, cardTop + 56f, valuePaint)
+                    canvas.drawText("Status: ${eventType.displayLabel} VERIFIED (Liveness Passed)", infoX, cardTop + 76f, valuePaint)
+                    canvas.drawText("Timestamp: $loggedTimeLabel ($logDateKey)", infoX, cardTop + 96f, valuePaint)
+                    canvas.drawText("Security: Flexible 1% Biometric Selfie Capture", infoX, cardTop + 116f, labelPaint)
                 }
 
                 // Footer

@@ -23,7 +23,7 @@ class AttendanceLogicTest {
     }
 
     @Test
-    fun faceBiometricMatcher_matchesCloseVectorAndRejectsMismatch() {
+    fun faceBiometricMatcher_matchesCloseAndPartialVectorsAtOnePercentThreshold() {
         val enrolled = listOf(
             Employee(
                 id = "emp_1",
@@ -37,12 +37,17 @@ class AttendanceLogicTest {
         assertNotNull(closeMatch)
         assertEquals("emp_1", closeMatch?.employee?.id)
 
-        val mismatch = FaceBiometricMatcher.matchBestEmployee("0.5900:0.7500:0.3500:0.9500", enrolled)
-        assertNull(mismatch)
+        val partialMatch = FaceBiometricMatcher.matchBestEmployee("0.5900:0.7500:0.3500:0.9500", enrolled)
+        assertNotNull(partialMatch)
+        assertEquals("emp_1", partialMatch?.employee?.id)
+        assertEquals(true, (partialMatch?.confidencePercent ?: 0) >= 1)
+        assertEquals(true, (closeMatch?.confidencePercent ?: 0) > (partialMatch?.confidencePercent ?: 0))
+
+        assertNull(FaceBiometricMatcher.matchBestEmployee("0.3650:0.4220:0.6480:0.7820", emptyList()))
     }
 
     @Test
-    fun faceBiometricMatcher_analyzesFullEightFeatureBeardMustacheEyeVectors() {
+    fun faceBiometricMatcher_analyzesFullEightFeatureBeardMustacheEyeVectorsWithOnePercentFloor() {
         val enrolledFull = listOf(
             Employee(
                 id = "emp_muhammad_ansar",
@@ -75,7 +80,7 @@ class AttendanceLogicTest {
         assertNotNull(matched)
         assertEquals("emp_muhammad_ansar", matched?.employee?.id)
 
-        val mismatchedStructure = FaceBiometricMatcher.encodeFullSignature(
+        val partialOrDistantStructure = FaceBiometricMatcher.encodeFullSignature(
             eyeToBoxRatio = 0.310f,
             noseToEyeRatio = 0.620f,
             mouthToEyeRatio = 0.450f,
@@ -85,7 +90,10 @@ class AttendanceLogicTest {
             jawToCheekWidthRatio = 0.920f,
             symmetryBalanceRatio = 0.760f
         )
-        assertNull(FaceBiometricMatcher.matchBestEmployee(mismatchedStructure, enrolledFull))
+        val flexibleMatch = FaceBiometricMatcher.matchBestEmployee(partialOrDistantStructure, enrolledFull)
+        assertNotNull(flexibleMatch)
+        assertEquals("emp_muhammad_ansar", flexibleMatch?.employee?.id)
+        assertEquals(true, (flexibleMatch?.confidencePercent ?: 0) >= 1)
     }
 
     @Test

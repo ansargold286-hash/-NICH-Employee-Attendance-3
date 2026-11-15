@@ -433,6 +433,10 @@ class AttendanceViewModel(
             }
         }
 
+        if (!frame.selfieImagePath.isNullOrBlank()) {
+            latestCapturedSelfiePath = frame.selfieImagePath
+        }
+
         if (!frame.faceDetected || scanMatchInFlight) return
 
         val steps = current.livenessSteps
@@ -471,10 +475,6 @@ class AttendanceViewModel(
             return
         }
 
-        if (!frame.selfieImagePath.isNullOrBlank()) {
-            latestCapturedSelfiePath = frame.selfieImagePath
-        }
-
         val liveSignature = frame.signature
         if (liveSignature.isNullOrBlank()) {
             consecutiveMatchCount = 0
@@ -503,8 +503,10 @@ class AttendanceViewModel(
             consecutiveMatchCount = 1
         }
 
-        // Direct transition to success state without secondary passcode steps
-        if (consecutiveMatchCount >= REQUIRED_CONFIRMING_FRAMES || match.confidencePercent >= 85) {
+        // Instant match at >= 1% confidence without secondary passcode or waiting loops
+        if (consecutiveMatchCount >= REQUIRED_CONFIRMING_FRAMES ||
+            match.confidencePercent >= FaceBiometricMatcher.MATCH_THRESHOLD_PERCENT
+        ) {
             scanMatchInFlight = true
             scanTimerJob?.cancel()
             val method = if (current.attempt == 1) {
@@ -538,6 +540,7 @@ class AttendanceViewModel(
         val timeLabel = AttendanceTimeRules.formatTimeLabel(now)
         val dateKey = AttendanceTimeRules.formatDateKey(now)
 
+        // Persist immediately to local storage so check-in/out never freezes the UI
         val localEntry = offlineStore.recordLocalAttendance(
             employee = employee,
             eventType = eventType,
@@ -548,27 +551,6 @@ class AttendanceViewModel(
             synced = false
         )
 
-        var syncedToCloud = false
-        val repo = repository
-        if (repo != null && !currentUserId.isNullOrBlank()) {
-            repo.upsertEmployee(employee)
-            val cloudResult = repo.logAttendance(
-                employee = employee,
-                eventType = eventType,
-                verificationMethod = method,
-                confidenceScore = confidence,
-                loggedTimeLabel = timeLabel,
-                loggedDateKey = dateKey,
-                explicitLogId = localEntry.id
-            )
-            if (cloudResult.isSuccess) {
-                offlineStore.markLogSynced(localEntry.id)
-                syncedToCloud = true
-            } else {
-                _cloudSyncError.value = cloudResult.exceptionOrNull()?.localizedMessage
-            }
-        }
-
         val senderAccount = emailReporter?.resolveSenderAccountEmail()
 
         _terminalPhase.value = TerminalUiPhase.Verified(
@@ -577,7 +559,7 @@ class AttendanceViewModel(
             verificationMethod = method,
             confidenceScore = confidence,
             timestampLabel = timeLabel,
-            syncedToCloud = syncedToCloud,
+            syncedToCloud = false,
             logId = localEntry.id,
             liveSelfiePath = liveSelfiePath,
             deviceSenderAccount = senderAccount,
@@ -588,13 +570,47 @@ class AttendanceViewModel(
             }
         )
 
+        // Sync to Firebase Firestore in background without blocking the verified screen
+        val repo = repository
+        if (repo != null && !currentUserId.isNullOrBlank()) {
+            viewModelScope.launch {
+                runCatching {
+                    repo.upsertEmployee(employee)
+                    repo.logAttendance(
+                        employee = employee,
+                        eventType = eventType,
+                        verificationMethod = method,
+                        confidenceScore = confidence,
+                        loggedTimeLabel = timeLabel,
+                        loggedDateKey = dateKey,
+                        explicitLogId = localEntry.id
+                    )
+                }.onSuccess { cloudResult ->
+                    if (cloudResult.isSuccess) {
+                        offlineStore.markLogSynced(localEntry.id)
+                        _terminalPhase.update { phase ->
+                            if (phase is TerminalUiPhase.Verified && phase.logId == localEntry.id) {
+                                phase.copy(syncedToCloud = true)
+                            } else {
+                                phase
+                            }
+                        }
+                    } else {
+                        _cloudSyncError.value = cloudResult.exceptionOrNull()?.localizedMessage
+                    }
+                }.onFailure { err ->
+                    _cloudSyncError.value = err.localizedMessage
+                }
+            }
+        }
+
         launchEmailReportDispatch(
             employee = employee,
             log = localEntry,
             eventType = eventType,
             verificationMethod = method,
             confidence = confidence,
-            syncedToCloud = syncedToCloud,
+            syncedToCloud = false,
             liveSelfiePath = liveSelfiePath
         )
 
@@ -804,7 +820,7 @@ class AttendanceViewModel(
         const val TAG = "AttendanceVM"
         const val ATTEMPT_DURATION_MS = 7000L
         const val VERIFIED_AUTO_RESET_MS = 8500L
-        const val REQUIRED_CONFIRMING_FRAMES = 2
-        const val LIVENESS_HOLD_FRAMES = 2
+        const val REQUIRED_CONFIRMING_FRAMES = 1
+        const val LIVENESS_HOLD_FRAMES = 1
     }
 }

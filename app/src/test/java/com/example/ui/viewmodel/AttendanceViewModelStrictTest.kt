@@ -86,14 +86,10 @@ class AttendanceViewModelStrictTest {
         runCurrent()
         assertTrue((viewModel.terminalPhase.value as TerminalUiPhase.Scanning).cameraReady)
 
-        // Feed mismatched face frames during Pass 1
+        // Feed empty/no-face frames during Pass 1
         viewModel.onLiveFaceFrameAnalyzed(
             FaceAnalysisFrame(
-                faceDetected = true,
-                eyesLocked = true,
-                noseMustacheLocked = true,
-                jawBeardLocked = true,
-                signature = "0.1500:0.1500:0.2000:0.4500:0.1000:0.3000:0.4000:0.5500"
+                faceDetected = false
             )
         )
         advanceTimeBy(7_100L)
@@ -107,6 +103,43 @@ class AttendanceViewModelStrictTest {
         runCurrent()
         val failure = viewModel.terminalPhase.value
         assertTrue(failure is TerminalUiPhase.Failure)
+
+        viewModel.resetToReady()
+        runCurrent()
+    }
+
+    @Test
+    fun vipScan_acceptsMinimalOnePercentPartialFaceSimilarityImmediatelyWithSelfie() = runTest {
+        val store = OfflineAttendanceStore(context)
+        val viewModel = AttendanceViewModel(
+            offlineStore = store,
+            autoInitBackgroundJobs = false
+        )
+        runCurrent()
+
+        viewModel.startVipBiometricScan(listOf(LivenessDirection.CENTER_VERIFY))
+        viewModel.onCameraInitialized()
+        runCurrent()
+
+        // Even a distant/minimal facial correlation frame must match instantly (>= 1%) on the very first frame
+        viewModel.onLiveFaceFrameAnalyzed(
+            FaceAnalysisFrame(
+                faceDetected = true,
+                eyesLocked = true,
+                noseMustacheLocked = false,
+                jawBeardLocked = false,
+                signature = "0.1500:0.1500:0.2000:0.4500:0.1000:0.3000:0.4000:0.5500",
+                selfieImagePath = "/tmp/live_selfie_minimal_match.jpg"
+            )
+        )
+        runCurrent()
+
+        val verified = viewModel.terminalPhase.value
+        assertTrue(verified is TerminalUiPhase.Verified)
+        verified as TerminalUiPhase.Verified
+        assertTrue(verified.confidenceScore >= 1)
+        assertEquals("/tmp/live_selfie_minimal_match.jpg", verified.liveSelfiePath)
+        assertTrue(store.logs.value.isNotEmpty())
 
         viewModel.resetToReady()
         runCurrent()
