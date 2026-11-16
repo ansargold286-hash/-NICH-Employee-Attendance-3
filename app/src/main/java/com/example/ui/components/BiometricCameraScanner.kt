@@ -749,7 +749,7 @@ internal fun analyzeFaceBiometrics(
         )
     }
 
-    val headPoseAligned = abs(yaw) <= 18f && abs(pitch) <= 18f && abs(roll) <= 18f
+    val headPoseAligned = abs(yaw) <= 25f && abs(pitch) <= 25f && abs(roll) <= 25f
 
     if (!eyesLocked || nose == null) {
         return FaceAnalysisFrame(

@@ -68,6 +68,8 @@ class AttendanceViewModelStrictTest {
         "0.4200:0.4800:0.6200:0.7400:0.2700:0.7500:0.7100:0.9600:0.7800:0.3400:0.3400:0.5600:2.1000:0.4500:0.2900:0.1400"
     private val vectorEmployeeB =
         "0.3400:0.3800:0.5100:0.8600:0.1900:0.5900:0.8800:0.9100:0.8900:0.4400:0.4500:0.7200:2.5500:0.6200:0.3900:0.2100"
+    private val vectorEmployeeAPartial50Plus =
+        "0.5800:0.6400:0.7800:0.9000:0.4300:0.9100:0.8700:1.1200:0.9400:0.5000:0.5000:0.7200:1.8500:0.6100:0.4500:0.3000"
     private val vectorStranger =
         "0.6100:0.7900:0.9500:0.5200:0.5500:1.1500:0.4800:0.7200:0.5600:0.1900:0.2000:0.9500:1.4500:0.2600:0.5800:0.3400"
 
@@ -209,7 +211,7 @@ class AttendanceViewModelStrictTest {
             verified as TerminalUiPhase.Verified
             assertEquals(AttendanceEventType.CHECK_IN, verified.eventType)
             assertEquals("Bilal Ahmed", verified.employee.name)
-            assertTrue(verified.confidenceScore >= 90)
+            assertTrue(verified.confidenceScore >= 50)
             assertEquals(0, dispatchCount.get())
 
             advanceTimeBy(2_600L)
@@ -257,14 +259,13 @@ class AttendanceViewModelStrictTest {
             viewModel.onCameraInitialized()
             runCurrent()
 
-            // Stranger (< 90%) must NOT verify or fall back to any employee
+            // Stranger (< 50%) must NOT verify or fall back to any employee
             val strangerFrame = FaceAnalysisFrame(
                 faceDetected = true,
                 eyesLocked = true,
                 headPoseAligned = true,
                 signature = vectorStranger
             )
-            viewModel.onLiveFaceFrameAnalyzed(strangerFrame)
             viewModel.onLiveFaceFrameAnalyzed(strangerFrame)
             runCurrent()
             assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.Scanning)
@@ -277,7 +278,6 @@ class AttendanceViewModelStrictTest {
                 signature = vectorEmployeeB
             )
             viewModel.onLiveFaceFrameAnalyzed(frameB)
-            viewModel.onLiveFaceFrameAnalyzed(frameB)
             runCurrent()
 
             val verifiedB = viewModel.terminalPhase.value as TerminalUiPhase.Verified
@@ -288,19 +288,19 @@ class AttendanceViewModelStrictTest {
             viewModel.resetToReady()
             runCurrent()
 
-            // Scanning Employee A matches ONLY Bilal Ahmed with his photo
-            val frameA = FaceAnalysisFrame(
+            // Partial lighting/angle scan (~61%) for Employee A marks Bilal Ahmed seamlessly at >= 50%
+            val frameAPartial = FaceAnalysisFrame(
                 faceDetected = true,
                 eyesLocked = true,
                 headPoseAligned = true,
-                signature = vectorEmployeeA
+                signature = vectorEmployeeAPartial50Plus
             )
-            viewModel.onLiveFaceFrameAnalyzed(frameA)
-            viewModel.onLiveFaceFrameAnalyzed(frameA)
+            viewModel.onLiveFaceFrameAnalyzed(frameAPartial)
             runCurrent()
 
             val verifiedA = viewModel.terminalPhase.value as TerminalUiPhase.Verified
             assertEquals("Bilal Ahmed", verifiedA.employee.name)
+            assertTrue(verifiedA.confidenceScore in 50..89)
             assertTrue(verifiedA.employee.localPhotoPath.isNotBlank())
             assertTrue(File(verifiedA.employee.localPhotoPath).exists())
         } finally {

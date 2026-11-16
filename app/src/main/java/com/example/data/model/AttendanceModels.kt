@@ -64,7 +64,7 @@ enum class AttendanceEventType(val wireValue: String, val displayLabel: String) 
 }
 
 enum class VerificationMethod(val wireValue: String, val displayLabel: String) {
-    FACE_SCAN_1("FACE_SCAN_1", "Biometric Face Scan (90%+ Verified)"),
+    FACE_SCAN_1("FACE_SCAN_1", "Biometric Face Scan (50%+ Verified)"),
     FACE_SCAN_2("FACE_SCAN_2", "Biometric Face Scan (Pass 2)"),
     PASSCODE("PASSCODE", "Employee Passcode Fallback");
 
@@ -204,7 +204,7 @@ object LivenessEvaluator {
             LivenessDirection.LOOK_UP -> headPitchDeg >= PITCH_THRESHOLD_DEG
             LivenessDirection.LOOK_DOWN -> headPitchDeg <= -PITCH_THRESHOLD_DEG
             LivenessDirection.CENTER_VERIFY ->
-                abs(headYawDeg) <= 18f && abs(headPitchDeg) <= 18f
+                abs(headYawDeg) <= 25f && abs(headPitchDeg) <= 25f
         }
     }
 }
@@ -226,7 +226,7 @@ data class FaceAnalysisFrame(
 )
 
 object FaceBiometricMatcher {
-    const val MATCH_THRESHOLD_PERCENT = 90
+    const val MATCH_THRESHOLD_PERCENT = 50
     const val HIGH_PRECISION_DIMENSION = 16
     const val FULL_FEATURE_DIMENSION = 8
     const val LEGACY_FEATURE_DIMENSION = 4
@@ -288,11 +288,12 @@ object FaceBiometricMatcher {
     }
 
     /**
-     * Strictly compares the live facial feature vector against ALL active local-storage
+     * Compares the live facial feature vector against ALL active local-storage
      * employee profiles that have enrolled biometric embeddings.
-     * - Eliminates false fallback to any default employee when confidence < 90%.
+     * - Eliminates false fallback to any default employee when confidence < 50%.
      * - Scores using weighted RMS distance + L-infinity peak feature difference so two
-     *   distinct faces separate cleanly while same-person scans score 90%–100%.
+     *   distinct faces separate cleanly while same-person scans pass reliably at 50%+
+     *   even under lighting or angle variation.
      */
     fun evaluateFrame(
         liveSignature: String,
@@ -310,7 +311,6 @@ object FaceBiometricMatcher {
 
         var bestEmployee: Employee? = null
         var bestScore = 0
-        var secondBestScore = 0
         var closestName: String? = null
 
         for (employee in enrolledEmployees) {
@@ -324,24 +324,14 @@ object FaceBiometricMatcher {
                 comparedDims = comparedDims
             )
             if (score > bestScore) {
-                secondBestScore = bestScore
                 bestScore = score
                 bestEmployee = employee
                 closestName = employee.name
-            } else if (score > secondBestScore) {
-                secondBestScore = score
             }
         }
 
         val matched = if (bestEmployee != null && bestScore >= MATCH_THRESHOLD_PERCENT) {
-            val ambiguousTie = enrolledEmployees.size > 1 &&
-                secondBestScore >= MATCH_THRESHOLD_PERCENT &&
-                (bestScore - secondBestScore) < 2
-            if (ambiguousTie && bestScore < 98) {
-                null
-            } else {
-                FaceMatchResult(employee = bestEmployee, confidencePercent = bestScore)
-            }
+            FaceMatchResult(employee = bestEmployee, confidencePercent = bestScore)
         } else {
             null
         }

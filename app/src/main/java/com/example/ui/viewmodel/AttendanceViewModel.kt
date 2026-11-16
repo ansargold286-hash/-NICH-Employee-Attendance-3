@@ -381,7 +381,7 @@ class AttendanceViewModel(
     }
 
     /**
-     * Launches continuous hands-free biometric face scanning with 90%+ accuracy verification.
+     * Launches continuous hands-free biometric face scanning with 50%+ fast verification.
      */
     fun startVipBiometricScan() {
         startVipBiometricScan(listOf(LivenessDirection.CENTER_VERIFY))
@@ -587,7 +587,7 @@ class AttendanceViewModel(
                     val hint = if (employees.none { FaceBiometricMatcher.parseSignature(it.faceSignature) != null }) {
                         "No registered faces in local storage • Tap Register"
                     } else {
-                        "Unrecognized face (${evaluation.bestConfidencePercent}% • need 90%+)"
+                        "Unrecognized face (${evaluation.bestConfidencePercent}% • need ${FaceBiometricMatcher.MATCH_THRESHOLD_PERCENT}%+)"
                     }
                     phase.copy(qualityHint = hint)
                 } else {
@@ -612,7 +612,7 @@ class AttendanceViewModel(
             consecutiveMatchCount = 1
         }
 
-        // High-accuracy lock: require >= 90% match confidence across confirming frames
+        // Smooth verification lock: accept any registered employee match >= 50% confidence
         if (consecutiveMatchCount >= REQUIRED_CONFIRMING_FRAMES &&
             match.confidencePercent >= FaceBiometricMatcher.MATCH_THRESHOLD_PERCENT
         ) {
@@ -979,7 +979,7 @@ class AttendanceViewModel(
         const val TAG = "AttendanceVM"
         const val ATTEMPT_DURATION_MS = 7000L
         const val VERIFIED_AUTO_RESET_MS = 2500L
-        const val REQUIRED_CONFIRMING_FRAMES = 2
+        const val REQUIRED_CONFIRMING_FRAMES = 1
         const val LIVENESS_HOLD_FRAMES = 1
     }
 }

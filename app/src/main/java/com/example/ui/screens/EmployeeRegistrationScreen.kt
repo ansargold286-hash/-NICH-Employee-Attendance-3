@@ -499,7 +499,7 @@ private fun EmployeeDraftCard(
 
                     Text(
                         text = if (draft.faceSignature.isNotBlank()) {
-                            "Face embedding locked for 90%+ recognition"
+                            "Face embedding locked for 50%+ fast recognition"
                         } else {
                             "Tap to capture live face photo & embedding"
                         },

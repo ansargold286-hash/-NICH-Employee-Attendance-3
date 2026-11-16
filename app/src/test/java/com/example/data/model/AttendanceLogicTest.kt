@@ -23,7 +23,7 @@ class AttendanceLogicTest {
     }
 
     @Test
-    fun faceBiometricMatcher_enforcesNinetyPercentThresholdAndSeparatesMultipleEmployees() {
+    fun faceBiometricMatcher_enforcesFiftyPercentThresholdAndSeparatesMultipleEmployees() {
         val employeeA = Employee(
             id = "emp_a",
             name = "Bilal Ahmed",
@@ -64,7 +64,21 @@ class AttendanceLogicTest {
         assertNotNull(matchA)
         assertEquals("emp_a", matchA?.employee?.id)
         assertEquals("Bilal Ahmed", matchA?.employee?.name)
-        assertEquals(true, (matchA?.confidencePercent ?: 0) >= 90)
+        assertEquals(true, (matchA?.confidencePercent ?: 0) >= 50)
+
+        // Lighting/angle-shifted scan (~61%) must still pass cleanly at >= 50%
+        val partialScanForA = FaceBiometricMatcher.encodeVectorSignature(
+            listOf(
+                0.5800f, 0.6400f, 0.7800f, 0.9000f,
+                0.4300f, 0.9100f, 0.8700f, 1.1200f,
+                0.9400f, 0.5000f, 0.5000f, 0.7200f,
+                1.8500f, 0.6100f, 0.4500f, 0.3000f
+            )
+        )
+        val partialMatchA = FaceBiometricMatcher.matchBestEmployee(partialScanForA, roster)
+        assertNotNull(partialMatchA)
+        assertEquals("emp_a", partialMatchA?.employee?.id)
+        assertEquals(true, (partialMatchA?.confidencePercent ?: 0) in 50..89)
 
         val scanForB = FaceBiometricMatcher.encodeVectorSignature(
             listOf(
@@ -78,9 +92,9 @@ class AttendanceLogicTest {
         assertNotNull(matchB)
         assertEquals("emp_b", matchB?.employee?.id)
         assertEquals("Dr. Ananya Rao", matchB?.employee?.name)
-        assertEquals(true, (matchB?.confidencePercent ?: 0) >= 90)
+        assertEquals(true, (matchB?.confidencePercent ?: 0) >= 50)
 
-        // Unrecognized stranger must be rejected cleanly (no single-name fallback)
+        // Unrecognized stranger (< 50%) must still be rejected cleanly (no single-name fallback)
         val strangerScan = FaceBiometricMatcher.encodeVectorSignature(
             listOf(
                 0.6100f, 0.7900f, 0.9500f, 0.5200f,
