@@ -47,7 +47,8 @@ class SmtpEmailSender(
         toEmail: String,
         subject: String,
         plainTextBody: String,
-        attachmentFile: File
+        attachmentFile: File,
+        extraAttachmentFile: File? = null
     ) {
         val cleanPassword = config.appPassword.replace(" ", "").trim()
         require(config.username.isNotBlank()) { "SMTP sender email must not be blank" }
@@ -58,13 +59,18 @@ class SmtpEmailSender(
         }
 
         val attachmentBytes = attachmentFile.readBytes()
+        val extraBytes = extraAttachmentFile
+            ?.takeIf { it.exists() && it.length() > 0L }
+            ?.readBytes()
         val mimePayload = buildMimeMessage(
             fromEmail = config.username.trim(),
             toEmail = toEmail.trim(),
             subject = subject,
             plainTextBody = plainTextBody,
             attachmentName = attachmentFile.name,
-            attachmentBytes = attachmentBytes
+            attachmentBytes = attachmentBytes,
+            extraAttachmentName = extraAttachmentFile?.name,
+            extraAttachmentBytes = extraBytes
         )
 
         socketConnector.connect(config).use { socket ->
@@ -115,7 +121,9 @@ class SmtpEmailSender(
         subject: String,
         plainTextBody: String,
         attachmentName: String,
-        attachmentBytes: ByteArray
+        attachmentBytes: ByteArray,
+        extraAttachmentName: String? = null,
+        extraAttachmentBytes: ByteArray? = null
     ): String {
         val boundary = "====NICH_ATT_${UUID.randomUUID().toString().replace("-", "")}===="
         val encodedSubject = "=?UTF-8?B?${encodeBase64SingleLine(subject)}?="
@@ -143,6 +151,15 @@ class SmtpEmailSender(
             append("Content-Transfer-Encoding: base64\r\n")
             append("\r\n")
             append(encodedPdf).append("\r\n")
+            if (!extraAttachmentName.isNullOrBlank() && extraAttachmentBytes != null && extraAttachmentBytes.isNotEmpty()) {
+                val encodedPhoto = Base64.encodeToString(extraAttachmentBytes, Base64.CRLF).trimEnd('\r', '\n')
+                append("--").append(boundary).append("\r\n")
+                append("Content-Type: image/jpeg; name=\"").append(extraAttachmentName).append("\"\r\n")
+                append("Content-Disposition: attachment; filename=\"").append(extraAttachmentName).append("\"\r\n")
+                append("Content-Transfer-Encoding: base64\r\n")
+                append("\r\n")
+                append(encodedPhoto).append("\r\n")
+            }
             append("--").append(boundary).append("--\r\n")
         }
     }

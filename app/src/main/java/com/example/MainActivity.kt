@@ -9,14 +9,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -28,7 +26,6 @@ import com.example.data.report.AttendanceEmailReporter
 import com.example.data.repository.AttendanceRepository
 import com.example.ui.screens.TerminalDashboardScreen
 import com.example.ui.theme.NichAttendanceTheme
-import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.viewmodel.AttendanceViewModel
 import com.google.firebase.Firebase
@@ -114,36 +111,30 @@ private fun StrictBiometricTerminalShell(
         }
     )
 
+    val context = LocalContext.current
     val terminalPhase by viewModel.terminalPhase.collectAsStateWithLifecycle()
-    val clock by viewModel.clock.collectAsStateWithLifecycle()
 
     Scaffold(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(ObsidianVoid, ObsidianSurface, ObsidianVoid)
-                )
-            ),
-        containerColor = ObsidianVoid.copy(alpha = 0f),
-        contentWindowInsets = WindowInsets.safeDrawing
+            .background(ObsidianVoid),
+        containerColor = ObsidianVoid,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { innerPadding ->
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            val context = LocalContext.current
             TerminalDashboardScreen(
                 terminalPhase = terminalPhase,
-                clock = clock,
                 onStartVipScan = viewModel::startVipBiometricScan,
                 onCameraInitialized = viewModel::onCameraInitialized,
                 onCameraInitFailed = viewModel::onCameraInitFailed,
                 onFrameAnalyzed = viewModel::onLiveFaceFrameAnalyzed,
-                onSendEmailAndFinish = {
-                    viewModel.sendEmailAndFinish { shareIntent ->
-                        runCatching { context.startActivity(shareIntent) }
+                onSendCheckOutEmail = {
+                    viewModel.sendEmailAndFinish { intent ->
+                        runCatching { context.startActivity(intent) }
                     }
                 },
                 onResetTerminal = viewModel::resetToReady

@@ -26,6 +26,7 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.UUID
 
 class OfflineAttendanceStore(context: Context) {
@@ -183,7 +184,7 @@ class OfflineAttendanceStore(context: Context) {
             loggedDateKey = loggedDateKey,
             createdAt = Timestamp.now()
         )
-        val updatedLogs = (listOf(entry) + _logs.value.filterNot { it.id == logId }).take(150)
+        val updatedLogs = (listOf(entry) + _logs.value.filterNot { it.id == logId }).take(MAX_LOCAL_LOGS)
         _logs.value = updatedLogs
         persistLogs(updatedLogs)
 
@@ -193,6 +194,61 @@ class OfflineAttendanceStore(context: Context) {
             persistStringSet(KEY_PENDING_SYNC_IDS, updatedPending)
         }
         return entry
+    }
+
+    fun persistSelfieForLog(logId: String, sourcePath: String?): String? {
+        if (logId.isBlank() || sourcePath.isNullOrBlank()) return null
+        val srcFile = File(sourcePath)
+        if (!srcFile.exists() || srcFile.length() <= 0L) return null
+
+        val storedPath = runCatching {
+            val dir = File(appContext.filesDir, "weekly_selfies").apply {
+                if (!exists()) mkdirs()
+            }
+            val safeId = logId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val destFile = File(dir, "$safeId.jpg")
+            if (srcFile.absolutePath != destFile.absolutePath) {
+                srcFile.copyTo(destFile, overwrite = true)
+            }
+            dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(MAX_STORED_SELFIES)?.forEach { old ->
+                runCatching { old.delete() }
+            }
+            destFile.absolutePath
+        }.getOrElse { srcFile.absolutePath }
+
+        val map = getSelfiePathsByLogId().toMutableMap()
+        map[logId] = storedPath
+        persistSelfiePathsMap(map)
+        return storedPath
+    }
+
+    fun getSelfiePathsByLogId(): Map<String, String> {
+        val raw = prefs.getString(KEY_LOG_SELFIES_JSON, null) ?: return emptyMap()
+        return try {
+            val obj = JSONObject(raw)
+            val result = LinkedHashMap<String, String>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = obj.optString(k)
+                if (v.isNotBlank()) {
+                    result[k] = v
+                }
+            }
+            result
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    private fun persistSelfiePathsMap(map: Map<String, String>) {
+        val trimmedEntries = map.entries
+            .filter { File(it.value).exists() }
+            .toList()
+            .takeLast(MAX_STORED_SELFIES)
+        val obj = JSONObject()
+        trimmedEntries.forEach { (k, v) -> obj.put(k, v) }
+        prefs.edit { putString(KEY_LOG_SELFIES_JSON, obj.toString()) }
     }
 
     fun markLogSynced(logId: String) {
@@ -254,11 +310,19 @@ class OfflineAttendanceStore(context: Context) {
 
     fun mergeRemoteLogs(remoteLogs: List<AttendanceLog>) {
         val pendingIds = _pendingSyncLogIds.value
-        val pendingLocalLogs = _logs.value.filter { it.id in pendingIds }
         val mergedById = LinkedHashMap<String, AttendanceLog>()
-        pendingLocalLogs.forEach { mergedById[it.id] = it }
-        remoteLogs.forEach { mergedById[it.id] = it }
-        val sorted = mergedById.values.sortedByDescending { it.createdAt?.seconds ?: 0L }
+        _logs.value.forEach { mergedById[it.id] = it }
+        remoteLogs.forEach { remote ->
+            if (remote.id !in pendingIds) {
+                mergedById[remote.id] = remote
+            }
+        }
+        val sorted = mergedById.values
+            .sortedWith(
+                compareByDescending<AttendanceLog> { it.createdAt?.seconds ?: 0L }
+                    .thenByDescending { it.loggedDateKey }
+            )
+            .take(MAX_LOCAL_LOGS)
         _logs.value = sorted
         persistLogs(sorted)
     }
@@ -392,6 +456,9 @@ class OfflineAttendanceStore(context: Context) {
         private const val KEY_PENDING_EMPLOYEE_IDS = "pending_employee_ids"
         private const val KEY_PENDING_DELETE_EMPLOYEE_IDS = "pending_delete_employee_ids"
         private const val KEY_PENDING_EMAIL_LOG_IDS = "pending_email_log_ids"
+        private const val KEY_LOG_SELFIES_JSON = "log_selfies_json"
+        private const val MAX_LOCAL_LOGS = 400
+        private const val MAX_STORED_SELFIES = 80
 
         const val MUHAMMAD_ANSAR_ID = "emp_muhammad_ansar"
         private const val LEGACY_ANSAR_FACE_SIGNATURE = "0.4350:0.4800:0.6400:0.7500"

@@ -3,16 +3,22 @@ package com.example.data.report
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextDirectionHeuristics
 import android.text.TextPaint
+import android.text.TextUtils
 import com.example.R
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
+import com.example.data.model.BidiTextHelper
 import com.example.data.model.Employee
 import com.example.data.model.VerificationMethod
 import java.io.File
@@ -46,7 +52,7 @@ object AttendancePdfGenerator {
 
         val summaryRows = listOf(
             "Report ID" to log.id,
-            "Employee Name" to employee.name,
+            "Employee Name" to BidiTextHelper.formatEmployeeHeaderTitle(employee.name, employee.employeeCode),
             "Employee Code" to employee.employeeCode,
             "Department" to employee.department,
             "Role Title" to employee.roleTitle,
@@ -67,6 +73,7 @@ object AttendancePdfGenerator {
             context = context,
             outFile = outFile,
             employeeName = employee.name,
+            employeeCode = employee.employeeCode,
             eventType = eventType,
             logDateKey = log.loggedDateKey,
             loggedTimeLabel = log.loggedTimeLabel,
@@ -94,6 +101,7 @@ object AttendancePdfGenerator {
         context: Context,
         outFile: File,
         employeeName: String,
+        employeeCode: String,
         eventType: AttendanceEventType,
         logDateKey: String,
         loggedTimeLabel: String,
@@ -208,6 +216,7 @@ object AttendancePdfGenerator {
                 val rowHeight = 28f
                 val tableWidth = PAGE_WIDTH - (MARGIN_X * 2f)
                 val colSplit = MARGIN_X + 165f
+                val valueWidth = (MARGIN_X + tableWidth) - colSplit - 8f
 
                 rows.forEachIndexed { index, (label, value) ->
                     val rowTop = tableTop + (index * rowHeight)
@@ -220,8 +229,24 @@ object AttendancePdfGenerator {
                             rowAltPaint
                         )
                     }
-                    canvas.drawText(label, MARGIN_X + 10f, rowTop + 18f, labelPaint)
-                    canvas.drawText(value.take(58), colSplit, rowTop + 18f, valuePaint)
+                    drawBidiBoundedText(
+                        canvas = canvas,
+                        text = label,
+                        x = MARGIN_X + 10f,
+                        yTop = rowTop,
+                        maxWidth = (colSplit - MARGIN_X - 24f),
+                        maxHeight = rowHeight,
+                        paint = labelPaint
+                    )
+                    drawBidiBoundedText(
+                        canvas = canvas,
+                        text = value,
+                        x = colSplit,
+                        yTop = rowTop,
+                        maxWidth = valueWidth,
+                        maxHeight = rowHeight,
+                        paint = valuePaint
+                    )
                 }
 
                 val tableBottom = tableTop + (rows.size * rowHeight)
@@ -244,24 +269,21 @@ object AttendancePdfGenerator {
                 y += 16f
 
                 todaysLogs.take(3).forEachIndexed { idx, item ->
-                    val lineY = y + (idx * 19f)
-                    canvas.drawText(
-                        "${idx + 1}. ${item.employeeName.take(28)} (${item.employeeCode}) — ${item.eventType} at ${item.loggedTimeLabel}",
-                        MARGIN_X + 6f,
-                        lineY + 12f,
-                        valuePaint
+                    val lineY = y + (idx * 20f)
+                    val formattedTitle = BidiTextHelper.formatEmployeeHeaderTitle(item.employeeName, item.employeeCode)
+                    drawBidiBoundedText(
+                        canvas = canvas,
+                        text = "${idx + 1}. $formattedTitle — ${item.eventType} at ${item.loggedTimeLabel}",
+                        x = MARGIN_X + 6f,
+                        yTop = lineY,
+                        maxWidth = tableWidth - 12f,
+                        maxHeight = 20f,
+                        paint = valuePaint
                     )
                 }
 
                 // Embedded Live Verification Selfie Card
-                val selfieBitmap: Bitmap? = if (!liveSelfiePath.isNullOrBlank()) {
-                    runCatching {
-                        val f = File(liveSelfiePath)
-                        if (f.exists() && f.length() > 0L) BitmapFactory.decodeFile(f.absolutePath) else null
-                    }.getOrNull()
-                } else {
-                    null
-                }
+                val selfieBitmap: Bitmap? = decodeSampledBitmap(liveSelfiePath, 256)
                 if (selfieBitmap != null) {
                     val cardTop = 602f
                     val cardBottom = 758f
@@ -283,11 +305,52 @@ object AttendancePdfGenerator {
                     selfieBitmap.recycle()
 
                     val infoX = thumbRect.right + 18f
-                    canvas.drawText("LIVE VERIFICATION SELFIE", infoX, cardTop + 34f, sectionPaint)
-                    canvas.drawText("Staff: ${employeeName.take(36)}", infoX, cardTop + 56f, valuePaint)
-                    canvas.drawText("Status: ${eventType.displayLabel} VERIFIED (Liveness Passed)", infoX, cardTop + 76f, valuePaint)
-                    canvas.drawText("Timestamp: $loggedTimeLabel ($logDateKey)", infoX, cardTop + 96f, valuePaint)
-                    canvas.drawText("Security: Flexible 1% Biometric Selfie Capture", infoX, cardTop + 116f, labelPaint)
+                    val infoWidth = (PAGE_WIDTH - MARGIN_X - 12f) - infoX
+                    drawBidiBoundedText(
+                        canvas = canvas,
+                        text = "LIVE VERIFICATION SELFIE",
+                        x = infoX,
+                        yTop = cardTop + 20f,
+                        maxWidth = infoWidth,
+                        maxHeight = 22f,
+                        paint = sectionPaint
+                    )
+                    drawBidiBoundedText(
+                        canvas = canvas,
+                        text = "Staff: ${BidiTextHelper.formatEmployeeHeaderTitle(employeeName, employeeCode)}",
+                        x = infoX,
+                        yTop = cardTop + 44f,
+                        maxWidth = infoWidth,
+                        maxHeight = 20f,
+                        paint = valuePaint
+                    )
+                    drawBidiBoundedText(
+                        canvas = canvas,
+                        text = "Status: ${eventType.displayLabel} VERIFIED (Liveness Passed)",
+                        x = infoX,
+                        yTop = cardTop + 66f,
+                        maxWidth = infoWidth,
+                        maxHeight = 20f,
+                        paint = valuePaint
+                    )
+                    drawBidiBoundedText(
+                        canvas = canvas,
+                        text = "Timestamp: $loggedTimeLabel ($logDateKey)",
+                        x = infoX,
+                        yTop = cardTop + 88f,
+                        maxWidth = infoWidth,
+                        maxHeight = 20f,
+                        paint = valuePaint
+                    )
+                    drawBidiBoundedText(
+                        canvas = canvas,
+                        text = "Security: Flexible 1% Biometric Selfie Capture",
+                        x = infoX,
+                        yTop = cardTop + 112f,
+                        maxWidth = infoWidth,
+                        maxHeight = 20f,
+                        paint = labelPaint
+                    )
                 }
 
                 // Footer
@@ -312,6 +375,57 @@ object AttendancePdfGenerator {
         }
     }
 
+    /**
+     * Renders mixed English/Urdu text safely with directional isolates and strict clip bounds
+     * so RTL words never flip LTR parentheses, hyphens, or timestamps and never overlap adjacent columns.
+     */
+    private fun drawBidiBoundedText(
+        canvas: Canvas,
+        text: String,
+        x: Float,
+        yTop: Float,
+        maxWidth: Float,
+        maxHeight: Float,
+        paint: TextPaint,
+        maxLines: Int = 1
+    ) {
+        if (text.isBlank()) return
+        val hasIsolates = text.indexOf('\u2066') >= 0 || text.indexOf('\u2067') >= 0
+        val prepared = if (hasIsolates) text else BidiTextHelper.isolateMixedText(text)
+        val widthPx = maxWidth.toInt().coerceAtLeast(1)
+        val layout = StaticLayout.Builder
+            .obtain(prepared, 0, prepared.length, paint, widthPx)
+            .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+            .setTextDirection(TextDirectionHeuristics.LTR)
+            .setMaxLines(maxLines)
+            .setEllipsize(TextUtils.TruncateAt.END)
+            .setIncludePad(false)
+            .build()
+        val verticalOffset = ((maxHeight - layout.height) / 2f).coerceAtLeast(0f)
+        canvas.save()
+        canvas.translate(x, yTop + verticalOffset)
+        canvas.clipRect(0f, -2f, maxWidth, maxHeight)
+        layout.draw(canvas)
+        canvas.restore()
+    }
+
+    private fun decodeSampledBitmap(path: String?, reqSizePx: Int): Bitmap? {
+        if (path.isNullOrBlank()) return null
+        val file = File(path)
+        if (!file.exists() || file.length() <= 0L) return null
+        return runCatching {
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, opts)
+            var sampleSize = 1
+            val maxDim = maxOf(opts.outWidth, opts.outHeight)
+            while (maxDim / sampleSize > reqSizePx * 2) {
+                sampleSize *= 2
+            }
+            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            BitmapFactory.decodeFile(file.absolutePath, decodeOpts)
+        }.getOrNull()
+    }
+
     private fun writeFallbackPdf14(
         outFile: File,
         eventType: AttendanceEventType,
@@ -329,7 +443,7 @@ object AttendancePdfGenerator {
             add("AUTOMATED BIOMETRIC & PASSCODE ATTENDANCE SYSTEM")
             add("------------------------------------------------------------")
             rows.forEach { (label, value) ->
-                add("$label: $value")
+                add("$label: ${BidiTextHelper.stripBidiControls(value)}")
             }
             if (!liveSelfiePath.isNullOrBlank()) {
                 val selfieFile = File(liveSelfiePath)
@@ -341,25 +455,30 @@ object AttendancePdfGenerator {
             add("DAILY TERMINAL ACTIVITY ($logDateKey)")
             add("Total Logged: ${todaysLogs.size} | Check-Ins: $checkInsToday | Check-Outs: $checkOutsToday")
             todaysLogs.take(5).forEachIndexed { idx, item ->
-                add("${idx + 1}. ${item.employeeName} (${item.employeeCode}) - ${item.eventType} at ${item.loggedTimeLabel}")
+                add("${idx + 1}. ${BidiTextHelper.stripBidiControls(item.employeeName)} (${item.employeeCode}) - ${item.eventType} at ${item.loggedTimeLabel}")
             }
             add("------------------------------------------------------------")
             add("Dispatched automatically to $recipientEmail")
         }
 
+        writeSimpleAsciiLinesPdf(outFile, lines)
+    }
+
+    private fun writeSimpleAsciiLinesPdf(outFile: File, lines: List<String>) {
+        val maxLinesPerDoc = lines.take(40)
         val contentStream = buildString {
             append("BT\n")
-            append("/F1 11 Tf\n")
-            var cursorY = 790
-            lines.forEachIndexed { idx, rawLine ->
+            append("/F1 10 Tf\n")
+            var cursorY = 795
+            maxLinesPerDoc.forEachIndexed { idx, rawLine ->
                 val safe = escapePdfText(rawLine)
                 if (idx == 0) {
-                    append("40 $cursorY Td\n")
+                    append("36 $cursorY Td\n")
                 } else {
-                    append("0 -18 Td\n")
+                    append("0 -17 Td\n")
                 }
                 append("($safe) Tj\n")
-                cursorY -= 18
+                cursorY -= 17
             }
             append("ET\n")
         }
@@ -394,18 +513,19 @@ object AttendancePdfGenerator {
     }
 
     private fun escapePdfText(input: String): String {
-        val ascii = buildString(input.length) {
-            for (ch in input) {
+        val stripped = BidiTextHelper.stripBidiControls(input)
+        val ascii = buildString(stripped.length) {
+            for (ch in stripped) {
                 when (ch) {
                     '\\' -> append("\\\\")
                     '(' -> append("\\(")
                     ')' -> append("\\)")
                     in ' '..'~' -> append(ch)
                     '•', '—' -> append('-')
-                    else -> append('?')
+                    else -> if (ch.code > 0x007F) append('?') else Unit
                 }
             }
         }
-        return ascii.take(96)
+        return ascii.take(104)
     }
 }

@@ -196,4 +196,14 @@ class AttendanceLogicTest {
             )
         )
     }
+
+    @Test
+    fun bidiTextHelper_isolatesMixedEnglishUrduWithoutReversingParentheses() {
+        val formatted = BidiTextHelper.formatEmployeeHeaderTitle(
+            rawName = "محمد انصار (Muhammad Ansar)",
+            employeeCode = "NICH-0147"
+        )
+        assertEquals(true, formatted.contains("\u2067محمد انصار\u2069"))
+        assertEquals("Muhammad Ansar / محمد انصار - NICH-0147", BidiTextHelper.stripBidiControls(formatted))
+    }
 }

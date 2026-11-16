@@ -2,4 +2,7 @@
     <string name="app_name">NICH Employee Attendance 3</string>
     <string name="send_email_and_finish">Send Email &amp; Finish</string>
     <string name="dispatching_email_and_finishing">Sending Email &amp; Finishing...</string>
+    <string name="verification_successful">Verification Successful</string>
+    <string name="camera_permission_required">Camera Access Required</string>
+    <string name="grant_camera_permission">Allow Camera</string>
 </resources>

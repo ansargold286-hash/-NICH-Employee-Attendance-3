@@ -332,3 +332,64 @@ object FaceBiometricMatcher {
         employees: List<Employee>
     ): FaceMatchResult? = evaluateFrame(liveSignature, employees).match
 }
+
+object BidiTextHelper {
+    private const val LRI = "\u2066"
+    private const val RLI = "\u2067"
+    private const val PDI = "\u2069"
+    private const val LRM = "\u200E"
+
+    private val arabicUrduRegex = Regex("[\\u0600-\\u06FF\\u0750-\\u077F\\u08A0-\\u08FF\\uFB50-\\uFDFF\\uFE70-\\uFEFF]+(?:\\s+[\\u0600-\\u06FF\\u0750-\\u077F\\u08A0-\\u08FF\\uFB50-\\uFDFF\\uFE70-\\uFEFF]+)*")
+    private val parensLatinRegex = Regex("\\(([A-Za-z0-9][A-Za-z0-9 .,'_-]*)\\)")
+    private val parensUrduRegex = Regex("\\(([\\u0600-\\u06FF\\u0750-\\u077F\\u08A0-\\u08FF\\uFB50-\\uFDFF\\uFE70-\\uFEFF\\s]+)\\)")
+
+    fun isolateMixedText(raw: String): String {
+        if (raw.isBlank()) return ""
+        val isolated = arabicUrduRegex.replace(raw) { match ->
+            "$RLI${match.value}$PDI"
+        }
+        return "$LRI$isolated$PDI"
+    }
+
+    fun formatEmployeeHeaderTitle(rawName: String, employeeCode: String): String {
+        val cleanName = rawName.trim()
+        val cleanCode = employeeCode.trim()
+        val containsArabic = arabicUrduRegex.containsMatchIn(cleanName)
+        val displayTitle = if (containsArabic) {
+            val latinInParens = parensLatinRegex.find(cleanName)?.groupValues?.getOrNull(1)?.trim()
+            val urduWithoutLatinParens = parensLatinRegex.replace(cleanName, "").trim()
+            val urduInParens = parensUrduRegex.find(cleanName)?.groupValues?.getOrNull(1)?.trim()
+            val latinWithoutUrduParens = parensUrduRegex.replace(cleanName, "").trim()
+
+            when {
+                !latinInParens.isNullOrBlank() && urduWithoutLatinParens.isNotBlank() ->
+                    "$LRI$latinInParens / $RLI$urduWithoutLatinParens$PDI${if (cleanCode.isNotBlank()) " - $cleanCode" else ""}$PDI"
+                !urduInParens.isNullOrBlank() && latinWithoutUrduParens.isNotBlank() ->
+                    "$LRI$latinWithoutUrduParens / $RLI$urduInParens$PDI${if (cleanCode.isNotBlank()) " - $cleanCode" else ""}$PDI"
+                else ->
+                    "$LRI${isolateMixedText(cleanName)}${if (cleanCode.isNotBlank()) "$LRM - $cleanCode" else ""}$PDI"
+            }
+        } else {
+            val combined = if (cleanCode.isNotBlank()) "$cleanName - $cleanCode" else cleanName
+            "$LRI$combined$PDI"
+        }
+        return displayTitle
+    }
+
+    fun isolateLtrToken(token: String): String {
+        return if (token.isBlank()) "" else "$LRI${token.trim()}$PDI"
+    }
+
+    fun stripBidiControls(input: String): String {
+        return buildString(input.length) {
+            for (ch in input) {
+                when (ch) {
+                    '\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E',
+                    '\u2066', '\u2067', '\u2068', '\u2069' -> Unit
+                    else -> append(ch)
+                }
+            }
+        }
+    }
+}
+

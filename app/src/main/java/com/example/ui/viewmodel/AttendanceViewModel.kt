@@ -64,7 +64,7 @@ sealed interface TerminalUiPhase {
         val logId: String = "",
         val liveSelfiePath: String? = null,
         val deviceSenderAccount: String? = null,
-        val emailReportStatus: EmailReportStatus = EmailReportStatus.DISPATCHING
+        val emailReportStatus: EmailReportStatus = EmailReportStatus.NEEDS_CONFIG
     ) : TerminalUiPhase
 
     data class Failure(
@@ -93,7 +93,10 @@ class AttendanceViewModel(
     private val repository: AttendanceRepository? = null,
     private val currentUserId: String? = null,
     private val emailReporter: AttendanceEmailReporter? = null,
-    autoInitBackgroundJobs: Boolean = true
+    autoInitBackgroundJobs: Boolean = true,
+    private val calendarProvider: () -> Calendar = { Calendar.getInstance() },
+    private val continuousKioskMode: Boolean = true,
+    private val sameEmployeeCooldownMs: Long = 3_000L
 ) : ViewModel() {
 
     val employeesState: StateFlow<DataUiState<List<Employee>>> =
@@ -119,11 +122,33 @@ class AttendanceViewModel(
     private val _cloudSyncError = MutableStateFlow<String?>(null)
     val cloudSyncError: StateFlow<String?> = _cloudSyncError.asStateFlow()
 
-    private val _terminalPhase = MutableStateFlow<TerminalUiPhase>(TerminalUiPhase.Ready)
+    private val _terminalPhase = MutableStateFlow<TerminalUiPhase>(
+        if (autoInitBackgroundJobs) {
+            TerminalUiPhase.Scanning(
+                attempt = 1,
+                statusHeadline = "TERMINAL SCANNER ACTIVE",
+                cameraReady = false,
+                livenessSteps = listOf(LivenessDirection.CENTER_VERIFY),
+                currentLivenessStepIndex = 0
+            )
+        } else {
+            TerminalUiPhase.Ready
+        }
+    )
     val terminalPhase: StateFlow<TerminalUiPhase> = _terminalPhase.asStateFlow()
 
-    private val _clock = MutableStateFlow(ClockSnapshot())
+    private val _clock = MutableStateFlow(buildClockSnapshot(calendarProvider()))
     val clock: StateFlow<ClockSnapshot> = _clock.asStateFlow()
+
+    private fun buildClockSnapshot(now: Calendar): ClockSnapshot {
+        val hour = now.get(Calendar.HOUR_OF_DAY)
+        return ClockSnapshot(
+            timeLabel = AttendanceTimeRules.formatTimeLabel(now),
+            dateKey = AttendanceTimeRules.formatDateKey(now),
+            eventType = AttendanceTimeRules.determineEventType(hour),
+            windowLabel = AttendanceTimeRules.windowDescription(hour)
+        )
+    }
 
     private var scanTimerJob: Job? = null
     private var resetTimerJob: Job? = null
@@ -132,6 +157,8 @@ class AttendanceViewModel(
     private var consecutiveMatchCount = 0
     private var livenessHoldCount = 0
     private var lastMatchedEmployeeId: String? = null
+    private var lastVerifiedEmployeeId: String? = null
+    private var lastVerifiedTimestampMs: Long = 0L
     private var latestCapturedSelfiePath: String? = null
     private var analyzedFaceFrames = 0
     private var rejectedFaceFrames = 0
@@ -153,14 +180,7 @@ class AttendanceViewModel(
 
             viewModelScope.launch {
                 while (isActive) {
-                    val now = Calendar.getInstance()
-                    val hour = now.get(Calendar.HOUR_OF_DAY)
-                    _clock.value = ClockSnapshot(
-                        timeLabel = AttendanceTimeRules.formatTimeLabel(now),
-                        dateKey = AttendanceTimeRules.formatDateKey(now),
-                        eventType = AttendanceTimeRules.determineEventType(hour),
-                        windowLabel = AttendanceTimeRules.windowDescription(hour)
-                    )
+                    _clock.value = buildClockSnapshot(calendarProvider())
                     delay(1000L)
                 }
             }
@@ -277,6 +297,7 @@ class AttendanceViewModel(
 
         val employeesById = offlineStore.employees.value.associateBy { it.id }
         val logsById = offlineStore.logs.value.associateBy { it.id }
+        val selfieMap = offlineStore.getSelfiePathsByLogId()
         val recentLogs = offlineStore.logs.value
         val pendingCloudIds = offlineStore.pendingSyncLogIds.value
 
@@ -301,7 +322,8 @@ class AttendanceViewModel(
                 verificationMethod = VerificationMethod.fromWire(log.verificationMethod),
                 confidenceScore = log.confidenceScore.toInt(),
                 syncedToCloud = log.id !in pendingCloudIds,
-                recentDailyLogs = recentLogs
+                recentDailyLogs = recentLogs,
+                liveSelfiePath = selfieMap[log.id]
             )
             if (outcome == EmailReportStatus.SENT || outcome == EmailReportStatus.NEEDS_CONFIG) {
                 offlineStore.markEmailSent(logId)
@@ -310,14 +332,17 @@ class AttendanceViewModel(
     }
 
     /**
-     * Opens the live CameraX/ML Kit biometric scanner upon tapping VIP Attendance
-     * with a dynamic directional liveness sequence before frontal biometric verification.
+     * Launches continuous hands-free biometric face scanning with automatic background
+     * directional & liveness verification and 1% match sensitivity.
      */
     fun startVipBiometricScan() {
-        startVipBiometricScan(LivenessDirection.buildChallengeSequence())
+        startVipBiometricScan(listOf(LivenessDirection.CENTER_VERIFY))
     }
 
-    fun startVipBiometricScan(livenessSequence: List<LivenessDirection>) {
+    fun startVipBiometricScan(
+        livenessSequence: List<LivenessDirection>,
+        preserveCameraReady: Boolean = false
+    ) {
         val normalizedSequence = if (livenessSequence.isEmpty()) {
             listOf(LivenessDirection.CENTER_VERIFY)
         } else {
@@ -336,8 +361,8 @@ class AttendanceViewModel(
 
         _terminalPhase.value = TerminalUiPhase.Scanning(
             attempt = 1,
-            statusHeadline = "INITIALIZING CAMERA & LIVENESS ENGINE...",
-            cameraReady = false,
+            statusHeadline = "TERMINAL SCANNER ACTIVE",
+            cameraReady = preserveCameraReady,
             livenessSteps = normalizedSequence,
             currentLivenessStepIndex = 0
         )
@@ -345,7 +370,7 @@ class AttendanceViewModel(
 
     /**
      * Begins analysis timing only after CameraX hardware binding succeeds cleanly.
-     * On explicit full-scan rejection or timeout, transitions cleanly to Retry Failure (no secondary passcode).
+     * In continuous kiosk mode, stays ready inside Scanning standby indefinitely without blocking UI.
      */
     fun onCameraInitialized() {
         val current = _terminalPhase.value as? TerminalUiPhase.Scanning ?: return
@@ -365,6 +390,8 @@ class AttendanceViewModel(
                 phase
             }
         }
+
+        if (continuousKioskMode) return
 
         scanTimerJob?.cancel()
         scanTimerJob = viewModelScope.launch {
@@ -475,6 +502,18 @@ class AttendanceViewModel(
             return
         }
 
+        // Verify background directional pose alignment + eye liveness before matching
+        val frontalDirectionSatisfied = LivenessEvaluator.isDirectionSatisfied(
+            direction = LivenessDirection.CENTER_VERIFY,
+            headYawDeg = frame.headYawDeg,
+            headPitchDeg = frame.headPitchDeg,
+            isFrontCamera = frame.isFrontCamera
+        )
+        if (!frontalDirectionSatisfied) {
+            consecutiveMatchCount = 0
+            return
+        }
+
         val liveSignature = frame.signature
         if (liveSignature.isNullOrBlank()) {
             consecutiveMatchCount = 0
@@ -493,6 +532,14 @@ class AttendanceViewModel(
             if (evaluation.bestConfidencePercent > highestRejectedConfidence) {
                 highestRejectedConfidence = evaluation.bestConfidencePercent
             }
+            return
+        }
+
+        val nowMs = System.currentTimeMillis()
+        if (sameEmployeeCooldownMs > 0L &&
+            match.employee.id == lastVerifiedEmployeeId &&
+            (nowMs - lastVerifiedTimestampMs) < sameEmployeeCooldownMs
+        ) {
             return
         }
 
@@ -535,10 +582,12 @@ class AttendanceViewModel(
         explicitEventType: AttendanceEventType?,
         liveSelfiePath: String? = null
     ) {
-        val now = Calendar.getInstance()
+        val now = calendarProvider()
         val eventType = explicitEventType ?: AttendanceTimeRules.currentEventType(now)
         val timeLabel = AttendanceTimeRules.formatTimeLabel(now)
         val dateKey = AttendanceTimeRules.formatDateKey(now)
+        lastVerifiedEmployeeId = employee.id
+        lastVerifiedTimestampMs = System.currentTimeMillis()
 
         // Persist immediately to local storage so check-in/out never freezes the UI
         val localEntry = offlineStore.recordLocalAttendance(
@@ -550,6 +599,8 @@ class AttendanceViewModel(
             loggedDateKey = dateKey,
             synced = false
         )
+        val durableSelfiePath = offlineStore.persistSelfieForLog(localEntry.id, liveSelfiePath)
+            ?: liveSelfiePath
 
         val senderAccount = emailReporter?.resolveSenderAccountEmail()
 
@@ -561,16 +612,12 @@ class AttendanceViewModel(
             timestampLabel = timeLabel,
             syncedToCloud = false,
             logId = localEntry.id,
-            liveSelfiePath = liveSelfiePath,
+            liveSelfiePath = durableSelfiePath,
             deviceSenderAccount = senderAccount,
-            emailReportStatus = if (emailReporter != null) {
-                EmailReportStatus.DISPATCHING
-            } else {
-                EmailReportStatus.NEEDS_CONFIG
-            }
+            emailReportStatus = EmailReportStatus.NEEDS_CONFIG
         )
 
-        // Sync to Firebase Firestore in background without blocking the verified screen
+        // Sync to Firebase Firestore in background without blocking the verified confirmation
         val repo = repository
         if (repo != null && !currentUserId.isNullOrBlank()) {
             viewModelScope.launch {
@@ -604,29 +651,24 @@ class AttendanceViewModel(
             }
         }
 
-        launchEmailReportDispatch(
-            employee = employee,
-            log = localEntry,
-            eventType = eventType,
-            verificationMethod = method,
-            confidence = confidence,
-            syncedToCloud = false,
-            liveSelfiePath = liveSelfiePath
-        )
-
-        scheduleAutoResetToReady()
+        // Check-In: keep simple (no email button, auto-return to scanning).
+        // Check-Out: keep Verified overlay visible so employee can tap Send Email & Finish.
+        if (eventType == AttendanceEventType.CHECK_IN) {
+            scheduleAutoResetToReady()
+        }
     }
 
     /**
-     * Dispatches the attendance PDF report using the device's logged-in Google/Gmail account
-     * (via background SMTP when configured, or via pre-filled FileProvider Gmail Intent otherwise)
-     * and immediately returns the employee to the Ready main dashboard.
+     * Dispatches the individual attendance PDF report and live selfie photo
+     * to Nichemployeeattendance@gmail.com when the employee taps Send Email & Finish
+     * after a recorded Check-Out, then returns the terminal to active Scanning.
      */
     fun sendEmailAndFinish(onLaunchEmailIntent: (Intent) -> Unit) {
         val current = _terminalPhase.value as? TerminalUiPhase.Verified ?: run {
             resetToReady()
             return
         }
+        if (current.emailReportStatus == EmailReportStatus.DISPATCHING) return
 
         resetTimerJob?.cancel()
 
@@ -639,24 +681,40 @@ class AttendanceViewModel(
         val matchingLog = buildLogForVerifiedPhase(current)
         val snapshotLogs = offlineStore.logs.value
 
-        // If already sent silently via background SMTP, navigate cleanly back to Ready dashboard
         if (current.emailReportStatus == EmailReportStatus.SENT) {
             resetToReady()
             return
         }
 
+        _terminalPhase.update { phase ->
+            if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                phase.copy(emailReportStatus = EmailReportStatus.DISPATCHING)
+            } else {
+                phase
+            }
+        }
+
         viewModelScope.launch {
+            var dispatchedViaSmtp = false
             if (reporter.hasConfiguredSmtpCredentials()) {
-                launchEmailReportDispatch(
+                val outcome = reporter.generateAndSendReport(
                     employee = current.employee,
                     log = matchingLog,
                     eventType = current.eventType,
                     verificationMethod = current.verificationMethod,
-                    confidence = current.confidenceScore,
+                    confidenceScore = current.confidenceScore,
                     syncedToCloud = current.syncedToCloud,
+                    recentDailyLogs = snapshotLogs,
                     liveSelfiePath = current.liveSelfiePath
                 )
-            } else {
+                if (outcome == EmailReportStatus.SENT) {
+                    offlineStore.markEmailSent(matchingLog.id)
+                    retryPendingEmailReports()
+                    dispatchedViaSmtp = true
+                }
+            }
+
+            if (!dispatchedViaSmtp) {
                 runCatching {
                     val pdfFile = reporter.generateReportPdfFile(
                         employee = current.employee,
@@ -795,7 +853,14 @@ class AttendanceViewModel(
         resetTimerJob?.cancel()
         resetTimerJob = viewModelScope.launch {
             delay(VERIFIED_AUTO_RESET_MS)
-            resetToReady()
+            if (continuousKioskMode) {
+                startVipBiometricScan(
+                    livenessSequence = listOf(LivenessDirection.CENTER_VERIFY),
+                    preserveCameraReady = true
+                )
+            } else {
+                resetToReady()
+            }
         }
     }
 
@@ -807,7 +872,17 @@ class AttendanceViewModel(
         livenessHoldCount = 0
         lastMatchedEmployeeId = null
         latestCapturedSelfiePath = null
-        _terminalPhase.value = TerminalUiPhase.Ready
+        _terminalPhase.value = if (continuousKioskMode) {
+            TerminalUiPhase.Scanning(
+                attempt = 1,
+                statusHeadline = "TERMINAL SCANNER ACTIVE",
+                cameraReady = true,
+                livenessSteps = listOf(LivenessDirection.CENTER_VERIFY),
+                currentLivenessStepIndex = 0
+            )
+        } else {
+            TerminalUiPhase.Ready
+        }
     }
 
     override fun onCleared() {
@@ -819,7 +894,7 @@ class AttendanceViewModel(
     private companion object {
         const val TAG = "AttendanceVM"
         const val ATTEMPT_DURATION_MS = 7000L
-        const val VERIFIED_AUTO_RESET_MS = 8500L
+        const val VERIFIED_AUTO_RESET_MS = 2500L
         const val REQUIRED_CONFIRMING_FRAMES = 1
         const val LIVENESS_HOLD_FRAMES = 1
     }

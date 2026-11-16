@@ -55,9 +55,7 @@ class AttendanceEmailReporter(
             ?: senderEmailProvider().trim().ifEmpty { TARGET_RECIPIENT_EMAIL }
     }
 
-    fun resolveRecipientEmail(): String {
-        return senderEmailProvider().trim().ifEmpty { TARGET_RECIPIENT_EMAIL }
-    }
+    fun resolveRecipientEmail(): String = TARGET_RECIPIENT_EMAIL
 
     suspend fun generateReportPdfFile(
         employee: Employee,
@@ -131,6 +129,11 @@ class AttendanceEmailReporter(
             deviceAccountEmail = senderEmail
         )
 
+        val livePhotoFile = liveSelfiePath
+            ?.takeIf { it.isNotBlank() }
+            ?.let { File(it) }
+            ?.takeIf { it.exists() && it.length() > 0L }
+
         return@withContext try {
             smtpSender.sendWithAttachment(
                 config = SmtpConfig(
@@ -140,7 +143,8 @@ class AttendanceEmailReporter(
                 toEmail = recipientEmail,
                 subject = subject,
                 plainTextBody = body,
-                attachmentFile = pdfFile
+                attachmentFile = pdfFile,
+                extraAttachmentFile = livePhotoFile
             )
             EmailReportStatus.SENT
         } catch (e: Exception) {

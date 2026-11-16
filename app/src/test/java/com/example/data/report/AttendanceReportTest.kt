@@ -120,6 +120,13 @@ class AttendanceReportTest {
             recipientEmail = AttendanceEmailReporter.TARGET_RECIPIENT_EMAIL
         )
 
+        val selfieFile = java.io.File(context.cacheDir, "smtp_unit_selfie.jpg")
+        val bmp = android.graphics.Bitmap.createBitmap(48, 48, android.graphics.Bitmap.Config.ARGB_8888)
+        java.io.FileOutputStream(selfieFile).use { stream ->
+            bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, stream)
+        }
+        bmp.recycle()
+
         val serverSocket = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
         val receivedCommands = mutableListOf<String>()
         val dataPayload = StringBuilder()
@@ -190,7 +197,8 @@ class AttendanceReportTest {
                 toEmail = AttendanceEmailReporter.TARGET_RECIPIENT_EMAIL,
                 subject = "NICH Attendance 3 • CHECK-OUT • محمد انصار",
                 plainTextBody = "Attendance verified for NICH-0147.",
-                attachmentFile = pdfFile
+                attachmentFile = pdfFile,
+                extraAttachmentFile = selfieFile
             )
 
             assertTrue(serverDone.await(5, TimeUnit.SECONDS))
@@ -198,9 +206,11 @@ class AttendanceReportTest {
             assertTrue(receivedCommands.any { it == "RCPT TO:<Nichemployeeattendance@gmail.com>" })
             val rawMime = dataPayload.toString()
             assertTrue(rawMime.contains("Content-Type: application/pdf; name=\"${pdfFile.name}\""))
+            assertTrue(rawMime.contains("Content-Type: image/jpeg; name=\"${selfieFile.name}\""))
             assertTrue(rawMime.contains("Content-Transfer-Encoding: base64"))
         } finally {
             pdfFile.delete()
+            selfieFile.delete()
             runCatching { serverSocket.close() }
         }
     }
