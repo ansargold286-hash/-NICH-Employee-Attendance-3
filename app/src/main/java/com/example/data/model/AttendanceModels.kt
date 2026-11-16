@@ -2,11 +2,14 @@ package com.example.data.model
 
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentId
+import com.google.firebase.firestore.Exclude
 import com.google.firebase.firestore.IgnoreExtraProperties
 import com.google.firebase.firestore.ServerTimestamp
 import java.util.Calendar
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 @IgnoreExtraProperties
@@ -24,7 +27,8 @@ data class Employee(
     val faceSignature: String = "",
     val isActive: Boolean = true,
     @ServerTimestamp val createdAt: Timestamp? = null,
-    @ServerTimestamp val updatedAt: Timestamp? = null
+    @ServerTimestamp val updatedAt: Timestamp? = null,
+    @get:Exclude val localPhotoPath: String = ""
 )
 
 data class PasscodeMatchResult(
@@ -60,8 +64,8 @@ enum class AttendanceEventType(val wireValue: String, val displayLabel: String) 
 }
 
 enum class VerificationMethod(val wireValue: String, val displayLabel: String) {
-    FACE_SCAN_1("FACE_SCAN_1", "Biometric Face Scan (Pass 1)"),
-    FACE_SCAN_2("FACE_SCAN_2", "Biometric Face Scan (Auto-Retry)"),
+    FACE_SCAN_1("FACE_SCAN_1", "Biometric Face Scan (90%+ Verified)"),
+    FACE_SCAN_2("FACE_SCAN_2", "Biometric Face Scan (Pass 2)"),
     PASSCODE("PASSCODE", "Employee Passcode Fallback");
 
     companion object {
@@ -94,8 +98,8 @@ object PasscodeResolver {
 
 object AttendanceTimeRules {
     /**
-     * Morning (8:00 AM to 12:00 PM, and pre-noon hours < 12): CHECK_IN.
-     * Afternoon / Post-12:00 PM (12:00 PM onwards, hour >= 12): CHECK_OUT.
+     * Morning (before 12:00 PM): CHECK_IN.
+     * Afternoon (12:00 PM onwards): CHECK_OUT.
      */
     fun determineEventType(hourOfDay24: Int): AttendanceEventType {
         return if (hourOfDay24 < 12) {
@@ -169,7 +173,7 @@ enum class LivenessDirection(
         shortLabel = "LOOK DOWN"
     ),
     CENTER_VERIFY(
-        instruction = "LOOK STRAIGHT • VERIFYING & CAPTURING SELFIE",
+        instruction = "LOOK STRAIGHT • VERIFYING FACE",
         shortLabel = "CENTER MATCH"
     );
 
@@ -200,7 +204,7 @@ object LivenessEvaluator {
             LivenessDirection.LOOK_UP -> headPitchDeg >= PITCH_THRESHOLD_DEG
             LivenessDirection.LOOK_DOWN -> headPitchDeg <= -PITCH_THRESHOLD_DEG
             LivenessDirection.CENTER_VERIFY ->
-                abs(headYawDeg) <= 32f && abs(headPitchDeg) <= 32f
+                abs(headYawDeg) <= 18f && abs(headPitchDeg) <= 18f
         }
     }
 }
@@ -222,7 +226,8 @@ data class FaceAnalysisFrame(
 )
 
 object FaceBiometricMatcher {
-    const val MATCH_THRESHOLD_PERCENT = 1
+    const val MATCH_THRESHOLD_PERCENT = 90
+    const val HIGH_PRECISION_DIMENSION = 16
     const val FULL_FEATURE_DIMENSION = 8
     const val LEGACY_FEATURE_DIMENSION = 4
 
@@ -266,65 +271,104 @@ object FaceBiometricMatcher {
         )
     }
 
+    fun encodeVectorSignature(features: List<Float>): String {
+        return features.joinToString(":") { value ->
+            String.format(Locale.US, "%.4f", value)
+        }
+    }
+
     fun parseSignature(raw: String): List<Float>? {
         if (raw.isBlank()) return null
         val parts = raw.split(":").mapNotNull { it.toFloatOrNull() }
-        return if (parts.size == FULL_FEATURE_DIMENSION || parts.size == LEGACY_FEATURE_DIMENSION) {
+        return if (parts.size in LEGACY_FEATURE_DIMENSION..32) {
             parts
         } else {
             null
         }
     }
 
+    /**
+     * Strictly compares the live facial feature vector against ALL active local-storage
+     * employee profiles that have enrolled biometric embeddings.
+     * - Eliminates false fallback to any default employee when confidence < 90%.
+     * - Scores using weighted RMS distance + L-infinity peak feature difference so two
+     *   distinct faces separate cleanly while same-person scans score 90%–100%.
+     */
     fun evaluateFrame(
         liveSignature: String,
         employees: List<Employee>
     ): FaceEvaluationOutcome {
-        val activeEmployees = employees.filter { it.isActive }
-        if (activeEmployees.isEmpty()) {
+        val enrolledEmployees = employees.filter {
+            it.isActive && parseSignature(it.faceSignature) != null
+        }
+        if (enrolledEmployees.isEmpty()) {
             return FaceEvaluationOutcome(match = null, bestConfidencePercent = 0)
         }
 
         val liveVec = parseSignature(liveSignature)
-        if (liveVec == null) {
-            return FaceEvaluationOutcome(match = null, bestConfidencePercent = 0)
-        }
+            ?: return FaceEvaluationOutcome(match = null, bestConfidencePercent = 0)
 
         var bestEmployee: Employee? = null
         var bestScore = 0
+        var secondBestScore = 0
+        var closestName: String? = null
 
-        for (employee in activeEmployees) {
+        for (employee in enrolledEmployees) {
             val enrolledVec = parseSignature(employee.faceSignature) ?: continue
-            val comparedDims = minOf(liveVec.size, enrolledVec.size)
+            val comparedDims = min(liveVec.size, enrolledVec.size)
             if (comparedDims < LEGACY_FEATURE_DIMENSION) continue
 
-            var sumSq = 0.0
-            for (i in 0 until comparedDims) {
-                val diff = (liveVec[i] - enrolledVec[i]).toDouble()
-                sumSq += diff * diff
-            }
-            val rmsDistance = sqrt(sumSq / comparedDims.toDouble())
-            // Ultra-tolerant similarity scaling: any detected face correlation achieves >= 1%
-            val score = (99.0 - (rmsDistance * 60.0)).toInt().coerceIn(MATCH_THRESHOLD_PERCENT, 99)
+            val score = computeSimilarityScorePercent(
+                liveVec = liveVec,
+                enrolledVec = enrolledVec,
+                comparedDims = comparedDims
+            )
             if (score > bestScore) {
+                secondBestScore = bestScore
                 bestScore = score
                 bestEmployee = employee
+                closestName = employee.name
+            } else if (score > secondBestScore) {
+                secondBestScore = score
             }
         }
 
-        val candidate = bestEmployee ?: activeEmployees.first()
-        val finalScore = if (bestEmployee != null) {
-            bestScore.coerceIn(MATCH_THRESHOLD_PERCENT, 99)
+        val matched = if (bestEmployee != null && bestScore >= MATCH_THRESHOLD_PERCENT) {
+            val ambiguousTie = enrolledEmployees.size > 1 &&
+                secondBestScore >= MATCH_THRESHOLD_PERCENT &&
+                (bestScore - secondBestScore) < 2
+            if (ambiguousTie && bestScore < 98) {
+                null
+            } else {
+                FaceMatchResult(employee = bestEmployee, confidencePercent = bestScore)
+            }
         } else {
-            MATCH_THRESHOLD_PERCENT
+            null
         }
 
-        val matched = FaceMatchResult(employee = candidate, confidencePercent = finalScore)
         return FaceEvaluationOutcome(
             match = matched,
-            bestConfidencePercent = finalScore,
-            closestEmployeeName = candidate.name
+            bestConfidencePercent = bestScore,
+            closestEmployeeName = closestName
         )
+    }
+
+    internal fun computeSimilarityScorePercent(
+        liveVec: List<Float>,
+        enrolledVec: List<Float>,
+        comparedDims: Int
+    ): Int {
+        var sumSq = 0.0
+        var maxAbsDiff = 0.0
+        for (i in 0 until comparedDims) {
+            val diff = abs(liveVec[i].toDouble() - enrolledVec[i].toDouble())
+            sumSq += diff * diff
+            maxAbsDiff = max(maxAbsDiff, diff)
+        }
+        val rmsDistance = sqrt(sumSq / comparedDims.toDouble())
+        // Penalize both overall Euclidean drift and any single-feature mismatch
+        val penalty = (rmsDistance * 165.0) + (maxAbsDiff * 42.0)
+        return (100.0 - penalty).toInt().coerceIn(0, 100)
     }
 
     fun matchBestEmployee(
@@ -392,4 +436,3 @@ object BidiTextHelper {
         }
     }
 }
-

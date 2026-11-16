@@ -4,6 +4,7 @@ import android.content.Intent
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.local.LocalRegistrationInput
 import com.example.data.local.OfflineAttendanceStore
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
@@ -136,6 +137,11 @@ class AttendanceViewModel(
         }
     )
     val terminalPhase: StateFlow<TerminalUiPhase> = _terminalPhase.asStateFlow()
+
+    private val _showRegistrationScreen = MutableStateFlow(
+        autoInitBackgroundJobs && !offlineStore.hasRegisteredFaceProfiles()
+    )
+    val showRegistrationScreen: StateFlow<Boolean> = _showRegistrationScreen.asStateFlow()
 
     private val _clock = MutableStateFlow(buildClockSnapshot(calendarProvider()))
     val clock: StateFlow<ClockSnapshot> = _clock.asStateFlow()
@@ -331,9 +337,51 @@ class AttendanceViewModel(
         }
     }
 
+    fun openRegistrationScreen() {
+        scanTimerJob?.cancel()
+        resetTimerJob?.cancel()
+        scanMatchInFlight = false
+        consecutiveMatchCount = 0
+        lastMatchedEmployeeId = null
+        _showRegistrationScreen.value = true
+    }
+
+    fun closeRegistrationScreen() {
+        _showRegistrationScreen.value = false
+        startVipBiometricScan(
+            livenessSequence = listOf(LivenessDirection.CENTER_VERIFY),
+            preserveCameraReady = false
+        )
+    }
+
+    fun registerEmployeesBatch(inputs: List<LocalRegistrationInput>) {
+        if (inputs.isEmpty()) return
+        val registered = offlineStore.registerEmployeesBatch(inputs)
+        val repo = repository
+        if (repo != null && !currentUserId.isNullOrBlank() && registered.isNotEmpty()) {
+            viewModelScope.launch {
+                registered.forEach { emp ->
+                    repo.upsertEmployee(emp, overwriteIfExists = true)
+                        .onSuccess { offlineStore.markEmployeeSynced(emp.id) }
+                }
+            }
+        }
+        closeRegistrationScreen()
+    }
+
+    fun deleteRegisteredEmployee(employeeId: String) {
+        offlineStore.deleteEmployee(employeeId, queueCloudDelete = true)
+        val repo = repository
+        if (repo != null && !currentUserId.isNullOrBlank()) {
+            viewModelScope.launch {
+                repo.deleteEmployee(employeeId)
+                    .onSuccess { offlineStore.markEmployeeDeleteSynced(employeeId) }
+            }
+        }
+    }
+
     /**
-     * Launches continuous hands-free biometric face scanning with automatic background
-     * directional & liveness verification and 1% match sensitivity.
+     * Launches continuous hands-free biometric face scanning with 90%+ accuracy verification.
      */
     fun startVipBiometricScan() {
         startVipBiometricScan(listOf(LivenessDirection.CENTER_VERIFY))
@@ -502,15 +550,17 @@ class AttendanceViewModel(
             return
         }
 
-        // Verify background directional pose alignment + eye liveness before matching
-        val frontalDirectionSatisfied = LivenessEvaluator.isDirectionSatisfied(
-            direction = LivenessDirection.CENTER_VERIFY,
-            headYawDeg = frame.headYawDeg,
-            headPitchDeg = frame.headPitchDeg,
-            isFrontCamera = frame.isFrontCamera
-        )
-        if (!frontalDirectionSatisfied) {
+        // Require clean frontal alignment & locked eye landmarks for accurate recognition
+        if (!frame.headPoseAligned || !frame.eyesLocked) {
             consecutiveMatchCount = 0
+            lastMatchedEmployeeId = null
+            _terminalPhase.update { phase ->
+                if (phase is TerminalUiPhase.Scanning) {
+                    phase.copy(qualityHint = frame.qualityIssue ?: "Look straight into the camera")
+                } else {
+                    phase
+                }
+            }
             return
         }
 
@@ -532,6 +582,18 @@ class AttendanceViewModel(
             if (evaluation.bestConfidencePercent > highestRejectedConfidence) {
                 highestRejectedConfidence = evaluation.bestConfidencePercent
             }
+            _terminalPhase.update { phase ->
+                if (phase is TerminalUiPhase.Scanning) {
+                    val hint = if (employees.none { FaceBiometricMatcher.parseSignature(it.faceSignature) != null }) {
+                        "No registered faces in local storage • Tap Register"
+                    } else {
+                        "Unrecognized face (${evaluation.bestConfidencePercent}% • need 90%+)"
+                    }
+                    phase.copy(qualityHint = hint)
+                } else {
+                    phase
+                }
+            }
             return
         }
 
@@ -550,8 +612,8 @@ class AttendanceViewModel(
             consecutiveMatchCount = 1
         }
 
-        // Instant match at >= 1% confidence without secondary passcode or waiting loops
-        if (consecutiveMatchCount >= REQUIRED_CONFIRMING_FRAMES ||
+        // High-accuracy lock: require >= 90% match confidence across confirming frames
+        if (consecutiveMatchCount >= REQUIRED_CONFIRMING_FRAMES &&
             match.confidencePercent >= FaceBiometricMatcher.MATCH_THRESHOLD_PERCENT
         ) {
             scanMatchInFlight = true
@@ -651,10 +713,32 @@ class AttendanceViewModel(
             }
         }
 
-        // Check-In: keep simple (no email button, auto-return to scanning).
-        // Check-Out: keep Verified overlay visible so employee can tap Send Email & Finish.
+        // Conditional Email Notification:
+        // - CHECK-IN: Never dispatch email. Auto-return to live scanning after 2.5s.
+        // - CHECK-OUT: Automatically trigger SMTP/TLS email dispatch when Check-Out is recorded.
         if (eventType == AttendanceEventType.CHECK_IN) {
             scheduleAutoResetToReady()
+        } else {
+            val reporter = emailReporter
+            if (reporter != null && reporter.hasConfiguredSmtpCredentials()) {
+                _terminalPhase.update { phase ->
+                    if (phase is TerminalUiPhase.Verified && phase.logId == localEntry.id) {
+                        phase.copy(emailReportStatus = EmailReportStatus.DISPATCHING)
+                    } else {
+                        phase
+                    }
+                }
+                launchEmailReportDispatch(
+                    employee = employee,
+                    log = localEntry,
+                    eventType = eventType,
+                    verificationMethod = method,
+                    confidence = confidence,
+                    syncedToCloud = false,
+                    liveSelfiePath = durableSelfiePath,
+                    rescheduleResetAfter = false
+                )
+            }
         }
     }
 
@@ -895,7 +979,7 @@ class AttendanceViewModel(
         const val TAG = "AttendanceVM"
         const val ATTEMPT_DURATION_MS = 7000L
         const val VERIFIED_AUTO_RESET_MS = 2500L
-        const val REQUIRED_CONFIRMING_FRAMES = 1
+        const val REQUIRED_CONFIRMING_FRAMES = 2
         const val LIVENESS_HOLD_FRAMES = 1
     }
 }

@@ -1,10 +1,8 @@
 package com.example.data.local
 
 import android.content.Context
-import android.graphics.BitmapFactory
 import android.util.Log
 import androidx.core.content.edit
-import com.example.R
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
 import com.example.data.model.AttendanceTimeRules
@@ -13,21 +11,21 @@ import com.example.data.model.FaceBiometricMatcher
 import com.example.data.model.PasscodeMatchResult
 import com.example.data.model.PasscodeResolver
 import com.example.data.model.VerificationMethod
-import com.example.ui.components.extractFaceSignature
 import com.google.firebase.Timestamp
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.face.FaceDetection
-import com.google.mlkit.vision.face.FaceDetectorOptions
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
+
+data class LocalRegistrationInput(
+    val name: String,
+    val department: String = "Authorized Staff",
+    val photoPath: String,
+    val faceSignature: String
+)
 
 class OfflineAttendanceStore(context: Context) {
     private val appContext = context.applicationContext
@@ -51,58 +49,118 @@ class OfflineAttendanceStore(context: Context) {
     private val _pendingEmailLogIds = MutableStateFlow(loadStringSet(KEY_PENDING_EMAIL_LOG_IDS))
     val pendingEmailLogIds: StateFlow<Set<String>> = _pendingEmailLogIds.asStateFlow()
 
+    fun hasRegisteredFaceProfiles(): Boolean {
+        return _employees.value.any { emp ->
+            emp.isActive &&
+                emp.faceSignature.isNotBlank() &&
+                FaceBiometricMatcher.parseSignature(emp.faceSignature) != null
+        }
+    }
+
     /**
-     * Extracts ML Kit facial landmarks directly from the bundled Muhammad Ansar reference image
-     * so live camera scans use the exact same landmark geometry space.
+     * Previously calibrated a static bundled drawable for Muhammad Ansar, which could
+     * cause mismatches against other employees. Clear any legacy unverified synthetic
+     * vector unless backed by a live captured local photo.
      */
     suspend fun calibrateRegisteredReferenceFaces() {
         val current = _employees.value
-        val ansar = current.firstOrNull { it.id == MUHAMMAD_ANSAR_ID } ?: return
-        val existingDim = FaceBiometricMatcher.parseSignature(ansar.faceSignature)?.size ?: 0
-        if (ansar.faceSignature != DEFAULT_ANSAR_FACE_SIGNATURE &&
-            ansar.faceSignature != LEGACY_ANSAR_FACE_SIGNATURE &&
-            existingDim >= FaceBiometricMatcher.FULL_FEATURE_DIMENSION
-        ) {
-            return
+        var changed = false
+        val cleaned = current.map { emp ->
+            val hasRealPhoto = emp.localPhotoPath.isNotBlank() && File(emp.localPhotoPath).exists()
+            val isLegacySynthetic = emp.faceSignature == DEFAULT_ANSAR_FACE_SIGNATURE ||
+                emp.faceSignature == LEGACY_ANSAR_FACE_SIGNATURE
+            if (!hasRealPhoto && isLegacySynthetic) {
+                changed = true
+                emp.copy(faceSignature = "")
+            } else {
+                emp
+            }
         }
-        try {
-            val extracted = withContext(Dispatchers.Default) {
-                val bitmap = BitmapFactory.decodeResource(
-                    appContext.resources,
-                    R.drawable.emp_muhammad_ansar
-                ) ?: return@withContext null
-                val options = FaceDetectorOptions.Builder()
-                    .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
-                    .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
-                    .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
-                    .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
-                    .setMinFaceSize(0.15f)
-                    .build()
-                val detector = FaceDetection.getClient(options)
-                val faces = try {
-                    detector.process(InputImage.fromBitmap(bitmap, 0)).await()
-                } finally {
-                    detector.close()
-                }
-                val primaryFace = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
-                primaryFace?.let { extractFaceSignature(it) }
-            }
-            if (!extracted.isNullOrBlank()) {
-                val latest = _employees.value
-                val updated = latest.map { emp ->
-                    if (emp.id == MUHAMMAD_ANSAR_ID) emp.copy(faceSignature = extracted) else emp
-                }
-                _employees.value = updated
-                persistEmployees(updated)
-                markEmployeePendingSync(MUHAMMAD_ANSAR_ID)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Reference face extraction fallback active: ${e.message}")
+        if (changed) {
+            _employees.value = cleaned
+            persistEmployees(cleaned)
         }
     }
 
     fun verifyCode(rawCode: String, defaultEventType: AttendanceEventType): PasscodeMatchResult? {
         return PasscodeResolver.resolve(rawCode, _employees.value, defaultEventType)
+    }
+
+    /**
+     * Registers a batch of 1 or more locally captured employee profiles (Name + durable
+     * Internal Storage portrait photo + extracted ML Kit facial embedding) at once.
+     */
+    fun registerEmployeesBatch(inputs: List<LocalRegistrationInput>): List<Employee> {
+        if (inputs.isEmpty()) return emptyList()
+
+        val createdList = mutableListOf<Employee>()
+        var updatedList = _employees.value.toMutableList()
+        var nextNum = computeNextEmployeeNumber(updatedList)
+
+        for (input in inputs) {
+            val cleanName = input.name.trim()
+            if (cleanName.isBlank()) continue
+
+            val empId = "emp_${UUID.randomUUID().toString().replace("-", "").take(16)}"
+            val empCode = String.format(java.util.Locale.US, "NICH-%04d", nextNum)
+            val passcode = String.format(java.util.Locale.US, "%04d", nextNum)
+            nextNum++
+
+            val durablePhotoPath = persistRegisteredEmployeePhoto(empId, input.photoPath)
+
+            val newEmployee = Employee(
+                id = empId,
+                employeeCode = empCode,
+                name = cleanName,
+                department = input.department.trim().ifEmpty { "Authorized Staff" },
+                roleTitle = "Registered Staff",
+                passcode = passcode,
+                avatarKey = "avatar_local",
+                faceSignature = input.faceSignature.trim(),
+                isActive = true,
+                createdAt = Timestamp.now(),
+                updatedAt = Timestamp.now(),
+                localPhotoPath = durablePhotoPath
+            )
+            // Replace if same name already existed cleanly or append new
+            updatedList.add(newEmployee)
+            createdList.add(newEmployee)
+            markEmployeePendingSync(empId)
+        }
+
+        val sorted = updatedList.sortedBy { it.employeeCode }
+        _employees.value = sorted
+        persistEmployees(sorted)
+        prefs.edit { putBoolean(KEY_REGISTRATION_COMPLETED, true) }
+        return createdList
+    }
+
+    private fun computeNextEmployeeNumber(current: List<Employee>): Int {
+        val existingMax = current.mapNotNull { emp ->
+            emp.employeeCode.substringAfter("-", "").toIntOrNull()
+        }.maxOrNull() ?: 4000
+        return maxOf(4001, existingMax + 1)
+    }
+
+    private fun persistRegisteredEmployeePhoto(employeeId: String, sourcePath: String): String {
+        if (sourcePath.isBlank()) return ""
+        val srcFile = File(sourcePath)
+        if (!srcFile.exists() || srcFile.length() <= 0L) return ""
+
+        return runCatching {
+            val dir = File(appContext.filesDir, "employee_photos").apply {
+                if (!exists()) mkdirs()
+            }
+            val safeId = employeeId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val destFile = File(dir, "$safeId.jpg")
+            if (srcFile.absolutePath != destFile.absolutePath) {
+                srcFile.copyTo(destFile, overwrite = true)
+            }
+            destFile.absolutePath
+        }.getOrElse {
+            Log.w(TAG, "Failed to persist registered photo: ${it.message}")
+            sourcePath
+        }
     }
 
     fun addEmployee(
@@ -114,10 +172,13 @@ class OfflineAttendanceStore(context: Context) {
         checkInCode: String = "",
         checkOutCode: String = "",
         avatarKey: String,
-        faceSignature: String = ""
+        faceSignature: String = "",
+        localPhotoPath: String = ""
     ): Employee {
+        val empId = "emp_${UUID.randomUUID().toString().replace("-", "").take(16)}"
+        val durablePhotoPath = persistRegisteredEmployeePhoto(empId, localPhotoPath)
         val newEmployee = Employee(
-            id = "emp_${UUID.randomUUID().toString().replace("-", "").take(16)}",
+            id = empId,
             employeeCode = employeeCode.trim(),
             name = name.trim(),
             department = department.trim(),
@@ -129,7 +190,8 @@ class OfflineAttendanceStore(context: Context) {
             faceSignature = faceSignature.trim(),
             isActive = true,
             createdAt = Timestamp.now(),
-            updatedAt = Timestamp.now()
+            updatedAt = Timestamp.now(),
+            localPhotoPath = durablePhotoPath
         )
         val updated = (_employees.value + newEmployee).sortedBy { it.employeeCode }
         _employees.value = updated
@@ -148,6 +210,10 @@ class OfflineAttendanceStore(context: Context) {
     }
 
     fun deleteEmployee(employeeId: String, queueCloudDelete: Boolean = true) {
+        val target = _employees.value.firstOrNull { it.id == employeeId }
+        if (target != null && target.localPhotoPath.isNotBlank()) {
+            runCatching { File(target.localPhotoPath).delete() }
+        }
         val updated = _employees.value.filterNot { it.id == employeeId }
         _employees.value = updated
         persistEmployees(updated)
@@ -300,7 +366,9 @@ class OfflineAttendanceStore(context: Context) {
         val byId = _employees.value.associateBy { it.id }.toMutableMap()
         remoteEmployees.forEach { remote ->
             if (remote.id !in pendingDeletes && remote.id !in pendingEdits) {
-                byId[remote.id] = remote
+                // Preserve localPhotoPath stored on this device
+                val localPhoto = byId[remote.id]?.localPhotoPath.orEmpty()
+                byId[remote.id] = remote.copy(localPhotoPath = localPhoto)
             }
         }
         val merged = byId.values.filterNot { it.id in pendingDeletes }.sortedBy { it.employeeCode }
@@ -356,7 +424,8 @@ class OfflineAttendanceStore(context: Context) {
                     checkOutCode = obj.optString("checkOutCode"),
                     avatarKey = obj.optString("avatarKey", "avatar_1"),
                     faceSignature = obj.optString("faceSignature"),
-                    isActive = obj.optBoolean("isActive", true)
+                    isActive = obj.optBoolean("isActive", true),
+                    localPhotoPath = obj.optString("localPhotoPath")
                 )
             }
         } catch (_: Exception) {
@@ -381,6 +450,7 @@ class OfflineAttendanceStore(context: Context) {
                     put("avatarKey", emp.avatarKey)
                     put("faceSignature", emp.faceSignature)
                     put("isActive", emp.isActive)
+                    put("localPhotoPath", emp.localPhotoPath)
                 }
             )
         }
@@ -457,12 +527,12 @@ class OfflineAttendanceStore(context: Context) {
         private const val KEY_PENDING_DELETE_EMPLOYEE_IDS = "pending_delete_employee_ids"
         private const val KEY_PENDING_EMAIL_LOG_IDS = "pending_email_log_ids"
         private const val KEY_LOG_SELFIES_JSON = "log_selfies_json"
+        private const val KEY_REGISTRATION_COMPLETED = "local_registration_completed"
         private const val MAX_LOCAL_LOGS = 400
         private const val MAX_STORED_SELFIES = 80
 
         const val MUHAMMAD_ANSAR_ID = "emp_muhammad_ansar"
         private const val LEGACY_ANSAR_FACE_SIGNATURE = "0.4350:0.4800:0.6400:0.7500"
-        // Full 8-feature baseline landmark vector (eyes, nose, mouth, aspect, philtrum/mustache, beard/jaw drop, jaw/cheek, symmetry)
         const val DEFAULT_ANSAR_FACE_SIGNATURE =
             "0.4350:0.4800:0.6400:0.7500:0.2800:0.7600:0.7300:0.9500"
 
@@ -477,7 +547,7 @@ class OfflineAttendanceStore(context: Context) {
                 checkInCode = "147",
                 checkOutCode = "369",
                 avatarKey = "avatar_ansar",
-                faceSignature = DEFAULT_ANSAR_FACE_SIGNATURE,
+                faceSignature = "",
                 isActive = true
             ),
             Employee(

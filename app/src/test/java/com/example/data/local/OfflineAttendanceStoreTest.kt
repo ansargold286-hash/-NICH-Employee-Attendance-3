@@ -115,4 +115,50 @@ class OfflineAttendanceStoreTest {
         store.markEmployeeDeleteSynced(target.id)
         assertFalse(target.id in store.pendingDeleteEmployeeIds.value)
     }
+
+    @Test
+    fun registerEmployeesBatch_persistsMultipleNamesPhotosAndEmbeddingsLocally() {
+        val store = OfflineAttendanceStore(context)
+        assertFalse(store.hasRegisteredFaceProfiles())
+
+        val tempPhoto1 = java.io.File(context.cacheDir, "temp_reg_1.jpg")
+        val tempPhoto2 = java.io.File(context.cacheDir, "temp_reg_2.jpg")
+        tempPhoto1.writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()))
+        tempPhoto2.writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()))
+
+        try {
+            val saved = store.registerEmployeesBatch(
+                listOf(
+                    LocalRegistrationInput(
+                        name = "Ayesha Khan",
+                        department = "Diagnostics",
+                        photoPath = tempPhoto1.absolutePath,
+                        faceSignature = "0.4200:0.4800:0.6200:0.7400:0.2700:0.7500:0.7100:0.9600"
+                    ),
+                    LocalRegistrationInput(
+                        name = "Zainab Tariq",
+                        department = "Radiology",
+                        photoPath = tempPhoto2.absolutePath,
+                        faceSignature = "0.3400:0.3800:0.5100:0.8600:0.1900:0.5900:0.8800:0.9100"
+                    )
+                )
+            )
+            assertEquals(2, saved.size)
+            assertTrue(store.hasRegisteredFaceProfiles())
+
+            val reloaded = OfflineAttendanceStore(context)
+            assertTrue(reloaded.hasRegisteredFaceProfiles())
+            val ayesha = reloaded.employees.value.firstOrNull { it.name == "Ayesha Khan" }
+            val zainab = reloaded.employees.value.firstOrNull { it.name == "Zainab Tariq" }
+            assertNotNull(ayesha)
+            assertNotNull(zainab)
+            assertTrue(ayesha!!.localPhotoPath.isNotBlank())
+            assertTrue(java.io.File(ayesha.localPhotoPath).exists())
+            assertTrue(zainab!!.localPhotoPath.isNotBlank())
+            assertTrue(java.io.File(zainab.localPhotoPath).exists())
+        } finally {
+            tempPhoto1.delete()
+            tempPhoto2.delete()
+        }
+    }
 }

@@ -23,77 +23,74 @@ class AttendanceLogicTest {
     }
 
     @Test
-    fun faceBiometricMatcher_matchesCloseAndPartialVectorsAtOnePercentThreshold() {
-        val enrolled = listOf(
-            Employee(
-                id = "emp_1",
-                name = "Dr. Ananya Rao",
-                faceSignature = "0.3600:0.4200:0.6500:0.7800",
-                isActive = true
+    fun faceBiometricMatcher_enforcesNinetyPercentThresholdAndSeparatesMultipleEmployees() {
+        val employeeA = Employee(
+            id = "emp_a",
+            name = "Bilal Ahmed",
+            faceSignature = FaceBiometricMatcher.encodeVectorSignature(
+                listOf(
+                    0.4200f, 0.4800f, 0.6200f, 0.7400f,
+                    0.2700f, 0.7500f, 0.7100f, 0.9600f,
+                    0.7800f, 0.3400f, 0.3400f, 0.5600f,
+                    2.1000f, 0.4500f, 0.2900f, 0.1400f
+                )
+            ),
+            isActive = true
+        )
+        val employeeB = Employee(
+            id = "emp_b",
+            name = "Dr. Ananya Rao",
+            faceSignature = FaceBiometricMatcher.encodeVectorSignature(
+                listOf(
+                    0.3400f, 0.3800f, 0.5100f, 0.8600f,
+                    0.1900f, 0.5900f, 0.8800f, 0.9100f,
+                    0.8900f, 0.4400f, 0.4500f, 0.7200f,
+                    2.5500f, 0.6200f, 0.3900f, 0.2100f
+                )
+            ),
+            isActive = true
+        )
+        val roster = listOf(employeeA, employeeB)
+
+        val scanForA = FaceBiometricMatcher.encodeVectorSignature(
+            listOf(
+                0.4220f, 0.4820f, 0.6180f, 0.7420f,
+                0.2710f, 0.7490f, 0.7120f, 0.9580f,
+                0.7820f, 0.3420f, 0.3390f, 0.5620f,
+                2.1040f, 0.4520f, 0.2910f, 0.1410f
             )
         )
+        val matchA = FaceBiometricMatcher.matchBestEmployee(scanForA, roster)
+        assertNotNull(matchA)
+        assertEquals("emp_a", matchA?.employee?.id)
+        assertEquals("Bilal Ahmed", matchA?.employee?.name)
+        assertEquals(true, (matchA?.confidencePercent ?: 0) >= 90)
 
-        val closeMatch = FaceBiometricMatcher.matchBestEmployee("0.3650:0.4220:0.6480:0.7820", enrolled)
-        assertNotNull(closeMatch)
-        assertEquals("emp_1", closeMatch?.employee?.id)
-
-        val partialMatch = FaceBiometricMatcher.matchBestEmployee("0.5900:0.7500:0.3500:0.9500", enrolled)
-        assertNotNull(partialMatch)
-        assertEquals("emp_1", partialMatch?.employee?.id)
-        assertEquals(true, (partialMatch?.confidencePercent ?: 0) >= 1)
-        assertEquals(true, (closeMatch?.confidencePercent ?: 0) > (partialMatch?.confidencePercent ?: 0))
-
-        assertNull(FaceBiometricMatcher.matchBestEmployee("0.3650:0.4220:0.6480:0.7820", emptyList()))
-    }
-
-    @Test
-    fun faceBiometricMatcher_analyzesFullEightFeatureBeardMustacheEyeVectorsWithOnePercentFloor() {
-        val enrolledFull = listOf(
-            Employee(
-                id = "emp_muhammad_ansar",
-                name = "محمد انصار (Muhammad Ansar)",
-                faceSignature = FaceBiometricMatcher.encodeFullSignature(
-                    eyeToBoxRatio = 0.435f,
-                    noseToEyeRatio = 0.480f,
-                    mouthToEyeRatio = 0.640f,
-                    boxAspectRatio = 0.750f,
-                    philtrumToEyeRatio = 0.280f,
-                    jawChinDropRatio = 0.760f,
-                    jawToCheekWidthRatio = 0.730f,
-                    symmetryBalanceRatio = 0.950f
-                ),
-                isActive = true
+        val scanForB = FaceBiometricMatcher.encodeVectorSignature(
+            listOf(
+                0.3410f, 0.3820f, 0.5080f, 0.8580f,
+                0.1910f, 0.5920f, 0.8780f, 0.9120f,
+                0.8880f, 0.4410f, 0.4480f, 0.7190f,
+                2.5480f, 0.6180f, 0.3910f, 0.2090f
             )
         )
+        val matchB = FaceBiometricMatcher.matchBestEmployee(scanForB, roster)
+        assertNotNull(matchB)
+        assertEquals("emp_b", matchB?.employee?.id)
+        assertEquals("Dr. Ananya Rao", matchB?.employee?.name)
+        assertEquals(true, (matchB?.confidencePercent ?: 0) >= 90)
 
-        val alignedFull = FaceBiometricMatcher.encodeFullSignature(
-            eyeToBoxRatio = 0.440f,
-            noseToEyeRatio = 0.485f,
-            mouthToEyeRatio = 0.635f,
-            boxAspectRatio = 0.755f,
-            philtrumToEyeRatio = 0.285f,
-            jawChinDropRatio = 0.750f,
-            jawToCheekWidthRatio = 0.740f,
-            symmetryBalanceRatio = 0.945f
+        // Unrecognized stranger must be rejected cleanly (no single-name fallback)
+        val strangerScan = FaceBiometricMatcher.encodeVectorSignature(
+            listOf(
+                0.6100f, 0.7900f, 0.9500f, 0.5200f,
+                0.5500f, 1.1500f, 0.4800f, 0.7200f,
+                0.5600f, 0.1900f, 0.2000f, 0.9500f,
+                1.4500f, 0.2600f, 0.5800f, 0.3400f
+            )
         )
-        val matched = FaceBiometricMatcher.matchBestEmployee(alignedFull, enrolledFull)
-        assertNotNull(matched)
-        assertEquals("emp_muhammad_ansar", matched?.employee?.id)
-
-        val partialOrDistantStructure = FaceBiometricMatcher.encodeFullSignature(
-            eyeToBoxRatio = 0.310f,
-            noseToEyeRatio = 0.620f,
-            mouthToEyeRatio = 0.450f,
-            boxAspectRatio = 0.910f,
-            philtrumToEyeRatio = 0.410f,
-            jawChinDropRatio = 0.510f,
-            jawToCheekWidthRatio = 0.920f,
-            symmetryBalanceRatio = 0.760f
-        )
-        val flexibleMatch = FaceBiometricMatcher.matchBestEmployee(partialOrDistantStructure, enrolledFull)
-        assertNotNull(flexibleMatch)
-        assertEquals("emp_muhammad_ansar", flexibleMatch?.employee?.id)
-        assertEquals(true, (flexibleMatch?.confidencePercent ?: 0) >= 1)
+        assertNull(FaceBiometricMatcher.matchBestEmployee(strangerScan, roster))
+        assertNull(FaceBiometricMatcher.matchBestEmployee(scanForA, emptyList()))
     }
 
     @Test

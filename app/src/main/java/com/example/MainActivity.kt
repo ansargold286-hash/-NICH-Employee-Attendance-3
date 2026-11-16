@@ -22,12 +22,15 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.data.local.OfflineAttendanceStore
+import com.example.data.model.FaceBiometricMatcher
 import com.example.data.report.AttendanceEmailReporter
 import com.example.data.repository.AttendanceRepository
+import com.example.ui.screens.EmployeeRegistrationScreen
 import com.example.ui.screens.TerminalDashboardScreen
 import com.example.ui.theme.NichAttendanceTheme
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.viewmodel.AttendanceViewModel
+import com.example.ui.viewmodel.DataUiState
 import com.google.firebase.Firebase
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
@@ -113,6 +116,12 @@ private fun StrictBiometricTerminalShell(
 
     val context = LocalContext.current
     val terminalPhase by viewModel.terminalPhase.collectAsStateWithLifecycle()
+    val showRegistration by viewModel.showRegistrationScreen.collectAsStateWithLifecycle()
+    val employeesUi by viewModel.employeesState.collectAsStateWithLifecycle()
+    val employeesList = (employeesUi as? DataUiState.Success)?.data.orEmpty()
+    val enrolledFacesCount = remember(employeesList) {
+        employeesList.count { FaceBiometricMatcher.parseSignature(it.faceSignature) != null }
+    }
 
     Scaffold(
         modifier = Modifier
@@ -126,19 +135,30 @@ private fun StrictBiometricTerminalShell(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            TerminalDashboardScreen(
-                terminalPhase = terminalPhase,
-                onStartVipScan = viewModel::startVipBiometricScan,
-                onCameraInitialized = viewModel::onCameraInitialized,
-                onCameraInitFailed = viewModel::onCameraInitFailed,
-                onFrameAnalyzed = viewModel::onLiveFaceFrameAnalyzed,
-                onSendCheckOutEmail = {
-                    viewModel.sendEmailAndFinish { intent ->
-                        runCatching { context.startActivity(intent) }
-                    }
-                },
-                onResetTerminal = viewModel::resetToReady
-            )
+            if (showRegistration) {
+                EmployeeRegistrationScreen(
+                    savedEmployees = employeesList,
+                    onRegisterBatch = viewModel::registerEmployeesBatch,
+                    onDeleteEmployee = viewModel::deleteRegisteredEmployee,
+                    onNavigateToScanner = viewModel::closeRegistrationScreen
+                )
+            } else {
+                TerminalDashboardScreen(
+                    terminalPhase = terminalPhase,
+                    onStartVipScan = viewModel::startVipBiometricScan,
+                    onCameraInitialized = viewModel::onCameraInitialized,
+                    onCameraInitFailed = viewModel::onCameraInitFailed,
+                    onFrameAnalyzed = viewModel::onLiveFaceFrameAnalyzed,
+                    onSendCheckOutEmail = {
+                        viewModel.sendEmailAndFinish { intent ->
+                            runCatching { context.startActivity(intent) }
+                        }
+                    },
+                    onResetTerminal = viewModel::resetToReady,
+                    enrolledFacesCount = enrolledFacesCount,
+                    onOpenRegistration = viewModel::openRegistrationScreen
+                )
+            }
         }
     }
 }

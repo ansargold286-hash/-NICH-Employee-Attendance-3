@@ -3,9 +3,10 @@ package com.example.ui.screens
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -27,10 +29,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
@@ -76,6 +80,8 @@ fun TerminalDashboardScreen(
     onFrameAnalyzed: (FaceAnalysisFrame) -> Unit,
     onSendCheckOutEmail: () -> Unit,
     onResetTerminal: () -> Unit,
+    enrolledFacesCount: Int = 0,
+    onOpenRegistration: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     LaunchedEffect(terminalPhase) {
@@ -109,7 +115,64 @@ fun TerminalDashboardScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // Short transient confirmation overlay when attendance is logged
+        // Subtle live quality / matching guidance pill at the top center
+        val qualityHint = (terminalPhase as? TerminalUiPhase.Scanning)?.qualityHint
+        if (!qualityHint.isNullOrBlank()) {
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = ObsidianSurface.copy(alpha = 0.88f),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .safeDrawingPadding()
+                    .padding(top = 18.dp, start = 24.dp, end = 24.dp)
+                    .border(1.dp, NeonCyan.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+            ) {
+                Text(
+                    text = qualityHint,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextPrimary,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                )
+            }
+        }
+
+        // Bottom-left action pill to open Multi-Employee Local Registration Form
+        if (onOpenRegistration != null && terminalPhase is TerminalUiPhase.Scanning) {
+            OutlinedButton(
+                onClick = onOpenRegistration,
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.2.dp, NeonCyan.copy(alpha = 0.72f)),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = ObsidianSurface.copy(alpha = 0.88f),
+                    contentColor = NeonCyan
+                ),
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .navigationBarsPadding()
+                    .padding(start = 20.dp, bottom = 22.dp)
+                    .minimumInteractiveComponentSize()
+                    .testTag("open_registration_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.PersonAdd,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = if (enrolledFacesCount > 0) {
+                        "Register Staff ($enrolledFacesCount)"
+                    } else {
+                        "Register Staff"
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+
+        // Transient confirmation overlay when attendance is logged
         AnimatedVisibility(
             visible = terminalPhase is TerminalUiPhase.Verified,
             enter = fadeIn(tween(180)),
@@ -149,13 +212,14 @@ private fun VerificationSuccessOverlay(
     onSendCheckOutEmail: () -> Unit
 ) {
     val accent = if (phase.eventType == AttendanceEventType.CHECK_IN) NeonGreen else NeonCyan
-    val capturedSelfieBitmap = remember(phase.liveSelfiePath) {
-        val path = phase.liveSelfiePath
-        if (path.isNullOrBlank()) {
+    val registeredPhotoBitmap = remember(phase.employee.localPhotoPath, phase.liveSelfiePath) {
+        val registeredPath = phase.employee.localPhotoPath.takeIf { it.isNotBlank() }
+        val chosenPath = registeredPath ?: phase.liveSelfiePath
+        if (chosenPath.isNullOrBlank()) {
             null
         } else {
             runCatching {
-                val file = File(path)
+                val file = File(chosenPath)
                 if (file.exists() && file.length() > 0L) {
                     BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
                 } else {
@@ -209,17 +273,17 @@ private fun VerificationSuccessOverlay(
                     )
                 }
 
-                if (capturedSelfieBitmap != null) {
+                if (registeredPhotoBitmap != null) {
                     Box(
                         modifier = Modifier
-                            .size(84.dp)
+                            .size(92.dp)
                             .clip(CircleShape)
                             .border(2.dp, accent, CircleShape)
                             .background(ObsidianElevated),
                         contentAlignment = Alignment.Center
                     ) {
                         Image(
-                            bitmap = capturedSelfieBitmap,
+                            bitmap = registeredPhotoBitmap,
                             contentDescription = phase.employee.name,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
@@ -229,7 +293,7 @@ private fun VerificationSuccessOverlay(
                     EmployeeAvatar(
                         name = phase.employee.name,
                         avatarKey = phase.employee.avatarKey,
-                        size = 80.dp,
+                        size = 86.dp,
                         ringColor = accent
                     )
                 }
@@ -245,15 +309,16 @@ private fun VerificationSuccessOverlay(
                 )
 
                 Text(
-                    text = "${phase.eventType.displayLabel} • ${phase.timestampLabel}",
+                    text = "${phase.eventType.displayLabel} (${phase.confidenceScore}% Match) • ${phase.timestampLabel}",
                     style = MaterialTheme.typography.labelLarge,
                     color = TextSecondary,
                     textAlign = TextAlign.Center
                 )
 
-                // Check-Out ONLY: immediately display prominent email send button
+                // Conditional Email Notification: shown & triggered ONLY on Check-Out
                 if (phase.eventType == AttendanceEventType.CHECK_OUT) {
                     val isSending = phase.emailReportStatus == EmailReportStatus.DISPATCHING
+                    val isSent = phase.emailReportStatus == EmailReportStatus.SENT
                     Button(
                         onClick = onSendCheckOutEmail,
                         enabled = !isSending,
@@ -277,10 +342,10 @@ private fun VerificationSuccessOverlay(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (isSending) {
-                                stringResource(R.string.dispatching_email_and_finishing)
-                            } else {
-                                stringResource(R.string.send_email_and_finish)
+                            text = when {
+                                isSent -> "Email Sent • Finish"
+                                isSending -> stringResource(R.string.dispatching_email_and_finishing)
+                                else -> stringResource(R.string.send_email_and_finish)
                             },
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
@@ -288,11 +353,11 @@ private fun VerificationSuccessOverlay(
                         )
                     }
                     Text(
-                        text = AttendanceEmailReporter.TARGET_RECIPIENT_EMAIL,
+                        text = "${phase.emailReportStatus.label} (${AttendanceEmailReporter.TARGET_RECIPIENT_EMAIL})",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary,
                         textAlign = TextAlign.Center,
-                        maxLines = 1,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
                 }

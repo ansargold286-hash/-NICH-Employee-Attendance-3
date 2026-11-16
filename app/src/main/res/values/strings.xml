@@ -5,4 +5,10 @@
     <string name="verification_successful">Verification Successful</string>
     <string name="camera_permission_required">Camera Access Required</string>
     <string name="grant_camera_permission">Allow Camera</string>
+    <string name="register_employees">Register Employees</string>
+    <string name="add_another_employee">Add Another Employee</string>
+    <string name="submit_register_employees">Save &amp; Register Employees</string>
+    <string name="capture_live_photo">Capture Live Photo</string>
+    <string name="retake_photo">Retake Photo</string>
+    <string name="open_scanner">Open Scanner</string>
 </resources>
