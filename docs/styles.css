@@ -1,0 +1,544 @@
+/* NICH Employee Attendance 3 — Web Terminal Theme (aligned with Color.kt Material 3 tokens) */
+:root {
+  --obsidian-void: #050a14;
+  --obsidian-surface: #0b1426;
+  --obsidian-elevated: #111e36;
+  --obsidian-outline: #1e3557;
+
+  --neon-green: #00ff9d;
+  --neon-green-dim: #00b871;
+  --neon-cyan: #00e5ff;
+  --neon-blue: #2979ff;
+  --scanner-electric-blue: #29b6f6;
+  --neon-red: #ff4d6d;
+
+  --text-primary: #eaf6ff;
+  --text-secondary: #8aa4c8;
+  --text-muted: #566e90;
+
+  --font-display: "Space Grotesk", system-ui, -apple-system, sans-serif;
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background-color: var(--obsidian-void);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.terminal-root {
+  position: relative;
+  width: 100vw;
+  height: 100dvh;
+  background-color: var(--obsidian-void);
+  overflow: hidden;
+}
+
+.camera-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  background-color: var(--obsidian-void);
+}
+
+.scanner-overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* Official app logo badge anchored cleanly in the bottom-right corner */
+.terminal-app-badge {
+  position: absolute;
+  right: max(18px, env(safe-area-inset-right, 18px));
+  bottom: max(22px, env(safe-area-inset-bottom, 22px));
+  width: 58px;
+  height: 58px;
+  padding: 0;
+  border-radius: 15px;
+  border: 1.5px solid rgba(41, 182, 246, 0.78);
+  background: rgba(11, 20, 38, 0.92);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 0 18px rgba(41, 182, 246, 0.25);
+  overflow: visible;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  z-index: 15;
+  transition: transform 0.16s ease, border-color 0.2s ease;
+}
+
+.terminal-app-badge:hover {
+  transform: scale(1.04);
+  border-color: var(--neon-cyan);
+}
+
+.terminal-app-badge:active {
+  transform: scale(0.96);
+}
+
+.terminal-app-badge img {
+  width: 54px;
+  height: 54px;
+  border-radius: 13px;
+  object-fit: cover;
+  display: block;
+}
+
+.sync-dot {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  border: 2px solid var(--obsidian-void);
+  background-color: var(--text-muted);
+}
+
+.sync-dot.online {
+  background-color: var(--neon-green);
+  box-shadow: 0 0 8px var(--neon-green);
+}
+
+.sync-dot.offline {
+  background-color: var(--scanner-electric-blue);
+}
+
+/* Verification & Hardware Overlays */
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(5, 10, 20, 0.58);
+  backdrop-filter: blur(6px);
+  animation: fadeIn 0.18s ease-out;
+}
+
+.failure-backdrop {
+  background: rgba(5, 10, 20, 0.8);
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.terminal-card {
+  width: 100%;
+  max-width: 420px;
+  border-radius: 24px;
+  background: rgba(11, 20, 38, 0.96);
+  padding: 24px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.verified-card {
+  border: 2px solid var(--neon-green);
+}
+
+.verified-card.is-checkout {
+  border-color: var(--neon-cyan);
+}
+
+.verified-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--neon-green);
+}
+
+.verified-card.is-checkout .verified-header-row {
+  color: var(--neon-cyan);
+}
+
+.status-icon {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+}
+
+.verified-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.35rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.avatar-ring {
+  width: 88px;
+  height: 88px;
+  border-radius: 999px;
+  border: 2px solid var(--neon-green);
+  background: var(--obsidian-elevated);
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  margin-top: 2px;
+}
+
+.verified-card.is-checkout .avatar-ring {
+  border-color: var(--neon-cyan);
+}
+
+.avatar-ring img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.verified-employee-name {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.12rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.verified-meta {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  text-align: center;
+  letter-spacing: 0.02em;
+}
+
+.checkout-actions {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.btn-primary-send {
+  width: 100%;
+  min-height: 48px;
+  padding: 12px 18px;
+  border: none;
+  border-radius: 14px;
+  background-color: var(--neon-green);
+  color: var(--obsidian-void);
+  font-family: var(--font-sans);
+  font-size: 0.96rem;
+  font-weight: 700;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: transform 0.14s ease, filter 0.14s ease, opacity 0.14s ease;
+}
+
+.btn-primary-send:hover {
+  filter: brightness(1.06);
+}
+
+.btn-primary-send:active {
+  transform: scale(0.98);
+}
+
+.btn-primary-send:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.recipient-caption {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  text-align: center;
+  word-break: break-word;
+}
+
+/* Camera failure dialog */
+.failure-card {
+  max-width: 400px;
+  border: 1.5px solid rgba(255, 77, 109, 0.8);
+}
+
+.failure-icon {
+  width: 44px;
+  height: 44px;
+  color: var(--neon-red);
+}
+
+.failure-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.1rem;
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.failure-message {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.btn-cyan {
+  width: 100%;
+  min-height: 48px;
+  padding: 12px 18px;
+  border: none;
+  border-radius: 14px;
+  background-color: var(--neon-cyan);
+  color: var(--obsidian-void);
+  font-family: var(--font-sans);
+  font-size: 0.94rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: filter 0.15s ease, transform 0.15s ease;
+}
+
+.btn-cyan:hover {
+  filter: brightness(1.07);
+}
+
+.btn-cyan:active {
+  transform: scale(0.98);
+}
+
+.btn-outline {
+  width: 100%;
+  min-height: 48px;
+  padding: 12px 18px;
+  border-radius: 14px;
+  border: 1px solid var(--obsidian-outline);
+  background: var(--obsidian-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* Operator Cloud Sync Sheet */
+.operator-card {
+  max-width: 460px;
+  align-items: stretch;
+  gap: 16px;
+  border: 1.5px solid var(--obsidian-outline);
+  max-height: 88dvh;
+  overflow-y: auto;
+}
+
+.operator-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.operator-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.operator-brand img {
+  border-radius: 10px;
+  border: 1px solid rgba(41, 182, 246, 0.5);
+}
+
+.operator-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1rem;
+  color: var(--text-primary);
+}
+
+.operator-subtitle {
+  margin: 2px 0 0;
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+}
+
+.btn-icon-close {
+  min-width: 48px;
+  min-height: 48px;
+  border-radius: 12px;
+  border: 1px solid var(--obsidian-outline);
+  background: var(--obsidian-elevated);
+  color: var(--text-primary);
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.status-pill {
+  background: var(--obsidian-elevated);
+  border: 1px solid var(--obsidian-outline);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pill-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.pill-value {
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operator-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.recent-logs-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.recent-logs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.recent-logs-header h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.recent-logs-header span {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--obsidian-elevated);
+  color: var(--neon-cyan);
+}
+
+.recent-logs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.recent-log-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--obsidian-elevated);
+  border: 1px solid var(--obsidian-outline);
+  font-size: 0.8rem;
+}
+
+.recent-log-name {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.recent-log-sub {
+  font-size: 0.73rem;
+  color: var(--text-secondary);
+}
+
+.recent-log-tag {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 4px 8px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.recent-log-tag.checkin {
+  color: var(--neon-green);
+  background: rgba(0, 255, 157, 0.12);
+}
+
+.recent-log-tag.checkout {
+  color: var(--neon-cyan);
+  background: rgba(0, 229, 255, 0.12);
+}
+
+@media (max-width: 480px) {
+  .status-grid {
+    grid-template-columns: 1fr;
+  }
+}
