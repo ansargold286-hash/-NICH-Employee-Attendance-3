@@ -43,6 +43,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -1047,5 +1048,259 @@ class AttendanceViewModelStrictTest {
         composeRule.waitForIdle()
         assertEquals(1, settingsOpenedCount)
         assertTrue(warningSpokenCount >= 2)
+    }
+
+    @Test
+    fun persistentCheckOutLock_survivesAppRestart_blocksNewCheckInsUntilSmtpSucceeds() = runTest(testDispatcher) {
+        val spokenLines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val spySpeaker = object : VoiceSpeaker {
+            override fun speak(message: String, flush: Boolean) {
+                spokenLines += message
+            }
+            override fun shutdown() = Unit
+        }
+        val smtpNetworkReachable = java.util.concurrent.atomic.AtomicBoolean(false)
+        val receivedPayloads = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val serverSocket = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
+        val serverThread = Thread {
+            try {
+                while (!serverSocket.isClosed) {
+                    val client = serverSocket.accept()
+                    val reader = BufferedReader(InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8))
+                    val writer = OutputStreamWriter(client.getOutputStream(), StandardCharsets.US_ASCII)
+                    fun reply(msg: String) {
+                        writer.write("$msg\r\n")
+                        writer.flush()
+                    }
+                    reply("220 localhost ESMTP ready")
+                    var inData = false
+                    var sentAuthUser = false
+                    val payloadBuilder = StringBuilder()
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (inData) {
+                            if (line == ".") {
+                                inData = false
+                                receivedPayloads.add(payloadBuilder.toString())
+                                reply("250 2.0.0 OK queued")
+                            } else {
+                                payloadBuilder.append(line).append('\n')
+                            }
+                        } else {
+                            when {
+                                line.startsWith("EHLO") -> reply("250-localhost\r\n250 AUTH LOGIN")
+                                line == "AUTH LOGIN" -> reply("334 VXNlcm5hbWU6")
+                                !sentAuthUser && line != "AUTH LOGIN" -> {
+                                    sentAuthUser = true
+                                    reply("334 UGFzc3dvcmQ6")
+                                }
+                                line.startsWith("MAIL FROM:") -> reply("250 2.1.0 OK")
+                                line.startsWith("RCPT TO:") -> reply("250 2.1.5 OK")
+                                line == "DATA" -> {
+                                    reply("354 End data with <CR><LF>.<CR><LF>")
+                                    inData = true
+                                }
+                                line == "QUIT" -> {
+                                    reply("221 Bye")
+                                    break
+                                }
+                                else -> reply("235 2.7.0 OK")
+                            }
+                        }
+                    }
+                    client.close()
+                }
+            } catch (_: Exception) {
+            }
+        }
+        serverThread.isDaemon = true
+        serverThread.start()
+
+        val selfieFile = createTempPortrait("persistent_lock_selfie.jpg")
+        try {
+            val store1 = OfflineAttendanceStore(context)
+            store1.registerEmployeesBatch(
+                listOf(
+                    LocalRegistrationInput(
+                        name = "Bilal Ahmed",
+                        department = "Engineering",
+                        photoPath = selfieFile.absolutePath,
+                        faceSignature = vectorEmployeeA
+                    )
+                )
+            )
+
+            val smtpSender = SmtpEmailSender { _ ->
+                if (!smtpNetworkReachable.get()) {
+                    throw java.io.IOException("Simulated offline network during Check-Out")
+                }
+                Socket("127.0.0.1", serverSocket.localPort)
+            }
+            val reporter1 = AttendanceEmailReporter(
+                context = context,
+                smtpSender = smtpSender,
+                senderEmailProvider = { "Nichemployeeattendance@gmail.com" },
+                appPasswordProvider = { "abcd efgh ijkl mnop" }
+            )
+
+            val vm1Store = androidx.lifecycle.ViewModelStore()
+            val vm1 = androidx.lifecycle.ViewModelProvider(
+                vm1Store,
+                object : androidx.lifecycle.ViewModelProvider.Factory {
+                    @Suppress("UNCHECKED_CAST")
+                    override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+                        return AttendanceViewModel(
+                            offlineStore = store1,
+                            emailReporter = reporter1,
+                            autoInitBackgroundJobs = false,
+                            calendarProvider = { afternoonCheckOutCalendar() },
+                            voiceSpeaker = spySpeaker
+                        ) as T
+                    }
+                }
+            )[AttendanceViewModel::class.java]
+            runCurrent()
+            vm1.startVipBiometricScan(listOf(LivenessDirection.CENTER_VERIFY))
+            vm1.onCameraInitialized()
+            runCurrent()
+            feedLiveHumanBlinkFrames(vm1, vectorEmployeeA, selfieFile.absolutePath)
+            runCurrent()
+
+            val lockDeadline = System.currentTimeMillis() + 5_000L
+            while (store1.pendingCheckOutLock.value == null && System.currentTimeMillis() < lockDeadline) {
+                Thread.sleep(20L)
+                runCurrent()
+            }
+            // Wait until failed SMTP settles to QUEUED_OFFLINE
+            while (
+                (vm1.terminalPhase.value as? TerminalUiPhase.Verified)?.emailReportStatus != EmailReportStatus.QUEUED_OFFLINE &&
+                System.currentTimeMillis() < lockDeadline
+            ) {
+                Thread.sleep(20L)
+                runCurrent()
+            }
+            assertTrue(store1.isCheckOutEmailLocked)
+            assertEquals(1, store1.logs.value.size)
+
+            // 2. Simulate app kill & cold relaunch next morning (09:15 AM)
+            vm1Store.clear()
+            spokenLines.clear()
+            val storeAfterKill = OfflineAttendanceStore(context)
+            assertTrue(storeAfterKill.isCheckOutEmailLocked)
+            val reporter2 = AttendanceEmailReporter(
+                context = context,
+                smtpSender = smtpSender,
+                senderEmailProvider = { "Nichemployeeattendance@gmail.com" },
+                appPasswordProvider = { "abcd efgh ijkl mnop" }
+            )
+            val vmAfterRestartStore = androidx.lifecycle.ViewModelStore()
+            val vmAfterRestart = androidx.lifecycle.ViewModelProvider(
+                vmAfterRestartStore,
+                object : androidx.lifecycle.ViewModelProvider.Factory {
+                    @Suppress("UNCHECKED_CAST")
+                    override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T {
+                        return AttendanceViewModel(
+                            offlineStore = storeAfterKill,
+                            emailReporter = reporter2,
+                            autoInitBackgroundJobs = false,
+                            calendarProvider = { morningCheckInCalendar() },
+                            voiceSpeaker = spySpeaker
+                        ) as T
+                    }
+                }
+            )[AttendanceViewModel::class.java]
+            try {
+                runCurrent()
+
+                val lockedPhase = vmAfterRestart.terminalPhase.value as TerminalUiPhase.Verified
+                assertTrue(lockedPhase.isPersistentLock)
+                assertTrue(lockedPhase.emailEnforcementWarningActive)
+                assertEquals(VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT, lockedPhase.emailEnforcementMessage)
+
+                // 3. Attempting new Check-In scan/frames MUST be blocked & speak recurring lock prompt
+                vmAfterRestart.startVipBiometricScan(listOf(LivenessDirection.CENTER_VERIFY))
+                feedLiveHumanBlinkFrames(vmAfterRestart, vectorEmployeeA, selfieFile.absolutePath)
+                vmAfterRestart.openRegistrationScreen()
+                vmAfterRestart.resetToReady()
+                runCurrent()
+
+                assertTrue(vmAfterRestart.terminalPhase.value is TerminalUiPhase.Verified)
+                assertFalse(vmAfterRestart.showRegistrationScreen.value)
+                assertEquals(1, storeAfterKill.logs.value.size)
+                assertTrue(spokenLines.any { it == VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT })
+
+                // 4. Even tapping Send Email while still offline MUST keep lock active (no Gmail fallback bypass!)
+                vmAfterRestart.sendEmailAndFinish { }
+                val failedRetryDeadline = System.currentTimeMillis() + 5_000L
+                while (
+                    (vmAfterRestart.terminalPhase.value as? TerminalUiPhase.Verified)?.emailReportStatus == EmailReportStatus.DISPATCHING &&
+                    System.currentTimeMillis() < failedRetryDeadline
+                ) {
+                    Thread.sleep(20L)
+                    runCurrent()
+                }
+                assertTrue(storeAfterKill.isCheckOutEmailLocked)
+                assertTrue(vmAfterRestart.terminalPhase.value is TerminalUiPhase.Verified)
+
+                // 5. Restore network -> SMTP succeeds -> DB unlocks and new Check-In works!
+                smtpNetworkReachable.set(true)
+                vmAfterRestart.sendEmailAndFinish { }
+                val unlockDeadline = System.currentTimeMillis() + 5_000L
+                while (storeAfterKill.isCheckOutEmailLocked && System.currentTimeMillis() < unlockDeadline) {
+                    Thread.sleep(25L)
+                    runCurrent()
+                }
+                runCurrent()
+
+                assertFalse(storeAfterKill.isCheckOutEmailLocked)
+                assertNull(OfflineAttendanceStore(context).pendingCheckOutLock.value)
+                assertEquals(1, receivedPayloads.size)
+                assertTrue(vmAfterRestart.terminalPhase.value is TerminalUiPhase.Scanning)
+            } finally {
+                vmAfterRestartStore.clear()
+            }
+        } finally {
+            runCatching { serverSocket.close() }
+            selfieFile.delete()
+        }
+    }
+
+    @Test
+    fun terminalUi_persistentCheckOutLockDisplaysWarningBannerAndOfflineSavedBadge() {
+        val ansar = OfflineAttendanceStore.defaultPreRegisteredEmployees().first()
+        val lockedPhase = TerminalUiPhase.Verified(
+            employee = ansar,
+            eventType = AttendanceEventType.CHECK_OUT,
+            verificationMethod = VerificationMethod.FACE_SCAN_1,
+            confidenceScore = 95,
+            timestampLabel = "05:50:00 PM",
+            syncedToCloud = false,
+            logId = "log_locked_ui_1",
+            isPersistentLock = true,
+            emailReportStatus = EmailReportStatus.QUEUED_OFFLINE,
+            emailEnforcementWarningActive = true,
+            emailEnforcementMessage = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT,
+            checkOutEmailTriggeredOrSent = false
+        )
+
+        composeRule.setContent {
+            NichAttendanceTheme {
+                TerminalDashboardScreen(
+                    terminalPhase = lockedPhase,
+                    onStartVipScan = {},
+                    onCameraInitialized = {},
+                    onCameraInitFailed = {},
+                    onFrameAnalyzed = {},
+                    onSendCheckOutEmail = {},
+                    onResetTerminal = {}
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithTag("email_enforcement_warning_banner").assertIsDisplayed()
+        composeRule.onNodeWithText(VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT).assertIsDisplayed()
+        composeRule.onNodeWithTag("offline_lock_saved_badge").assertIsDisplayed()
+        composeRule.onNodeWithTag("send_checkout_email_button").assertIsDisplayed()
     }
 }

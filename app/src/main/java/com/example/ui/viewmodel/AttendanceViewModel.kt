@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.LocalRegistrationInput
 import com.example.data.local.OfflineAttendanceStore
+import com.example.data.local.PendingCheckOutLock
 import com.example.data.location.LocationAddressProvider
 import com.example.data.location.NoOpLocationAddressProvider
 import com.example.data.model.AntiSpoofingLivenessTracker
@@ -78,6 +79,8 @@ sealed interface TerminalUiPhase {
         val gpsCoordinates: String = "",
         val locationAddress: String = "",
         val timeSourceLabel: String = "",
+        val pdfReportPath: String = "",
+        val isPersistentLock: Boolean = false,
         val deviceSenderAccount: String? = null,
         val emailReportStatus: EmailReportStatus = EmailReportStatus.NEEDS_CONFIG,
         val emailEnforcementWarningActive: Boolean = false,
@@ -164,7 +167,9 @@ class AttendanceViewModel(
     val terminalPhase: StateFlow<TerminalUiPhase> = _terminalPhase.asStateFlow()
 
     private val _showRegistrationScreen = MutableStateFlow(
-        autoInitBackgroundJobs && !offlineStore.hasRegisteredFaceProfiles()
+        autoInitBackgroundJobs &&
+            !offlineStore.isCheckOutEmailLocked &&
+            !offlineStore.hasRegisteredFaceProfiles()
     )
     val showRegistrationScreen: StateFlow<Boolean> = _showRegistrationScreen.asStateFlow()
 
@@ -207,6 +212,14 @@ class AttendanceViewModel(
     private val antiSpoofingTracker = AntiSpoofingLivenessTracker()
 
     init {
+        val persistedLock = offlineStore.pendingCheckOutLock.value
+        if (persistedLock != null) {
+            restorePhaseFromPendingLock(
+                lock = persistedLock,
+                triggerVoice = autoInitBackgroundJobs
+            )
+        }
+
         if (autoInitBackgroundJobs) {
             viewModelScope.launch {
                 offlineStore.calibrateRegisteredReferenceFaces()
@@ -244,6 +257,74 @@ class AttendanceViewModel(
                     delay(1000L)
                 }
             }
+        }
+    }
+
+    private fun restorePhaseFromPendingLock(
+        lock: PendingCheckOutLock,
+        triggerVoice: Boolean,
+        throttleVoice: Boolean = false
+    ) {
+        scanTimerJob?.cancel()
+        resetTimerJob?.cancel()
+        scanMatchInFlight = false
+        _showRegistrationScreen.value = false
+
+        val matchedEmployee = offlineStore.employees.value.firstOrNull { it.id == lock.employeeId }
+            ?: Employee(
+                id = lock.employeeId,
+                employeeCode = lock.employeeCode,
+                name = lock.employeeName,
+                department = lock.department,
+                roleTitle = lock.roleTitle,
+                avatarKey = lock.avatarKey,
+                localPhotoPath = lock.localEmployeePhotoPath
+            )
+
+        val currentStatus = if (emailReporter?.hasConfiguredSmtpCredentials() == true) {
+            EmailReportStatus.QUEUED_OFFLINE
+        } else {
+            EmailReportStatus.NEEDS_CONFIG
+        }
+
+        _terminalPhase.value = TerminalUiPhase.Verified(
+            employee = matchedEmployee,
+            eventType = AttendanceEventType.CHECK_OUT,
+            verificationMethod = VerificationMethod.fromWire(lock.verificationMethod),
+            confidenceScore = lock.confidenceScore,
+            timestampLabel = lock.loggedTimeLabel,
+            syncedToCloud = lock.logId !in offlineStore.pendingSyncLogIds.value,
+            logId = lock.logId,
+            liveSelfiePath = lock.liveSelfiePath.ifBlank { null },
+            gpsCoordinates = lock.gpsCoordinates,
+            locationAddress = lock.locationAddress,
+            timeSourceLabel = lock.timeSource,
+            pdfReportPath = lock.pdfReportPath,
+            isPersistentLock = true,
+            deviceSenderAccount = emailReporter?.resolveSenderAccountEmail(),
+            emailReportStatus = currentStatus,
+            emailEnforcementWarningActive = true,
+            emailEnforcementMessage = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT,
+            checkOutEmailTriggeredOrSent = false
+        )
+
+        if (triggerVoice) {
+            if (throttleVoice) {
+                speakScanGuidance(
+                    key = "pending_checkout_lock",
+                    message = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT,
+                    minIntervalMs = 3_500L,
+                    urgent = true
+                )
+            } else {
+                voiceSpeaker.speak(VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT, flush = true)
+            }
+        }
+        if (emailReminderJob?.isActive != true) {
+            startCheckOutEmailEnforcementLoop(
+                logId = lock.logId,
+                promptMessage = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
+            )
         }
     }
 
@@ -388,13 +469,36 @@ class AttendanceViewModel(
                 recentDailyLogs = recentLogs,
                 liveSelfiePath = selfieMap[log.id]
             )
-            if (outcome == EmailReportStatus.SENT || outcome == EmailReportStatus.NEEDS_CONFIG) {
-                offlineStore.markEmailSent(logId)
+            if (outcome == EmailReportStatus.SENT) {
+                offlineStore.clearPendingCheckOutLock(logId)
+                val activeVerified = _terminalPhase.value as? TerminalUiPhase.Verified
+                if (activeVerified != null && activeVerified.logId == logId && activeVerified.isPersistentLock) {
+                    _terminalPhase.update { phase ->
+                        if (phase is TerminalUiPhase.Verified && phase.logId == logId) {
+                            phase.copy(
+                                emailReportStatus = EmailReportStatus.SENT,
+                                checkOutEmailTriggeredOrSent = true,
+                                isPersistentLock = false,
+                                emailEnforcementWarningActive = false
+                            )
+                        } else {
+                            phase
+                        }
+                    }
+                    emailReminderJob?.cancel()
+                    voiceSpeaker.speak(VoicePromptScript.emailDispatchedPrompt(openedDeviceApp = false), flush = true)
+                    scheduleAutoResetToReady()
+                }
             }
         }
     }
 
     fun openRegistrationScreen() {
+        val activeLock = offlineStore.pendingCheckOutLock.value
+        if (activeLock != null) {
+            restorePhaseFromPendingLock(activeLock, triggerVoice = true)
+            return
+        }
         scanTimerJob?.cancel()
         resetTimerJob?.cancel()
         emailReminderJob?.cancel()
@@ -450,6 +554,11 @@ class AttendanceViewModel(
         livenessSequence: List<LivenessDirection>,
         preserveCameraReady: Boolean = false
     ) {
+        val activeLock = offlineStore.pendingCheckOutLock.value
+        if (activeLock != null) {
+            restorePhaseFromPendingLock(activeLock, triggerVoice = true)
+            return
+        }
         val normalizedSequence = if (livenessSequence.isEmpty()) {
             listOf(LivenessDirection.CENTER_VERIFY)
         } else {
@@ -556,6 +665,15 @@ class AttendanceViewModel(
     }
 
     fun onLiveFaceFrameAnalyzed(frame: FaceAnalysisFrame) {
+        val activeLock = offlineStore.pendingCheckOutLock.value
+        if (activeLock != null) {
+            restorePhaseFromPendingLock(
+                lock = activeLock,
+                triggerVoice = frame.faceDetected,
+                throttleVoice = true
+            )
+            return
+        }
         val current = _terminalPhase.value as? TerminalUiPhase.Scanning ?: return
 
         val livenessResult = antiSpoofingTracker.evaluate(frame)
@@ -848,12 +966,31 @@ class AttendanceViewModel(
 
         // Conditional Email Notification & Strict Check-Out Enforcement:
         // - CHECK-IN: Never dispatch email. Auto-return to live scanning after 2.5s.
-        // - CHECK-OUT: Immediately generate PDF + trigger SMTP email dispatch if configured,
-        //              and enforce continuous AI prompt + blocking warning until email is sent/triggered.
+        // - CHECK-OUT: Persist durable offline Check-Out lock immediately BEFORE dispatching SMTP
+        //              so closing or killing the app cannot bypass pending email verification.
         if (eventType == AttendanceEventType.CHECK_IN) {
             scheduleAutoResetToReady()
         } else {
-            offlineStore.markEmailPending(localEntry.id)
+            offlineStore.savePendingCheckOutLock(
+                PendingCheckOutLock(
+                    logId = localEntry.id,
+                    employeeId = employee.id,
+                    employeeCode = employee.employeeCode,
+                    employeeName = employee.name,
+                    department = employee.department,
+                    roleTitle = employee.roleTitle,
+                    avatarKey = employee.avatarKey,
+                    localEmployeePhotoPath = employee.localPhotoPath,
+                    verificationMethod = method.wireValue,
+                    confidenceScore = confidence,
+                    loggedTimeLabel = timeLabel,
+                    loggedDateKey = dateKey,
+                    gpsCoordinates = gpsCoords,
+                    locationAddress = readableAddr,
+                    timeSource = timeSourceLabel,
+                    liveSelfiePath = durableSelfiePath.orEmpty()
+                )
+            )
             val reporter = emailReporter
             if (reporter != null && reporter.hasConfiguredSmtpCredentials()) {
                 _terminalPhase.update { phase ->
@@ -874,7 +1011,7 @@ class AttendanceViewModel(
                     rescheduleResetAfter = false
                 )
             } else {
-                // Pre-generate the structured weekly PDF report immediately so Send Email is instant
+                // Pre-generate & persist the structured weekly PDF report immediately for offline lock / Gmail dispatch
                 if (reporter != null) {
                     val recentLogsSnapshot = offlineStore.logs.value
                     viewModelScope.launch {
@@ -889,10 +1026,22 @@ class AttendanceViewModel(
                                 recentDailyLogs = recentLogsSnapshot,
                                 liveSelfiePath = durableSelfiePath
                             )
+                        }.onSuccess { pdfFile ->
+                            offlineStore.updatePendingCheckOutPdfPath(localEntry.id, pdfFile.absolutePath)
+                            _terminalPhase.update { phase ->
+                                if (phase is TerminalUiPhase.Verified && phase.logId == localEntry.id) {
+                                    phase.copy(pdfReportPath = pdfFile.absolutePath)
+                                } else {
+                                    phase
+                                }
+                            }
                         }
                     }
                 }
-                startCheckOutEmailEnforcementLoop(localEntry.id)
+                startCheckOutEmailEnforcementLoop(
+                    logId = localEntry.id,
+                    promptMessage = VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
+                )
             }
         }
     }
@@ -903,44 +1052,59 @@ class AttendanceViewModel(
      */
     fun attemptSkipOrDismissCheckOut() {
         val current = _terminalPhase.value as? TerminalUiPhase.Verified ?: return
-        if (current.isCheckOutEmailCompleted) {
+        if (current.isCheckOutEmailCompleted && offlineStore.pendingCheckOutLock.value == null) {
             resetToReady()
             return
+        }
+        val activePrompt = if (current.isPersistentLock) {
+            VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
+        } else {
+            VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
         }
         _terminalPhase.update { phase ->
             if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
                 phase.copy(
                     emailEnforcementWarningActive = true,
-                    emailEnforcementMessage = VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
+                    emailEnforcementMessage = activePrompt
                 )
             } else {
                 phase
             }
         }
-        voiceSpeaker.speak(VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT, flush = true)
+        voiceSpeaker.speak(activePrompt, flush = true)
     }
 
-    private fun startCheckOutEmailEnforcementLoop(logId: String) {
+    private fun startCheckOutEmailEnforcementLoop(
+        logId: String,
+        promptMessage: String = VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
+    ) {
         emailReminderJob?.cancel()
         emailReminderJob = viewModelScope.launch {
             while (isActive) {
                 delay(EMAIL_ENFORCEMENT_INTERVAL_MS)
                 val current = _terminalPhase.value as? TerminalUiPhase.Verified ?: break
-                if (current.logId != logId || current.isCheckOutEmailCompleted) {
+                if (current.logId != logId ||
+                    (current.isCheckOutEmailCompleted && offlineStore.pendingCheckOutLock.value == null)
+                ) {
                     break
                 }
                 if (current.emailReportStatus != EmailReportStatus.DISPATCHING) {
+                    val activePrompt = if (current.isPersistentLock) {
+                        VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
+                    } else {
+                        promptMessage
+                    }
                     _terminalPhase.update { phase ->
                         if (phase is TerminalUiPhase.Verified && phase.logId == logId) {
                             phase.copy(
                                 emailEnforcementWarningActive = true,
-                                emailEnforcementMessage = VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
+                                emailEnforcementMessage = activePrompt
                             )
                         } else {
                             phase
                         }
                     }
-                    voiceSpeaker.speak(VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT, flush = true)
+                    voiceSpeaker.speak(activePrompt, flush = true)
                 }
             }
         }
@@ -1001,9 +1165,11 @@ class AttendanceViewModel(
         }
 
         viewModelScope.launch {
+            val smtpConfigured = reporter.hasConfiguredSmtpCredentials()
             var dispatchedViaSmtp = false
             var openedDeviceShare = false
-            if (reporter.hasConfiguredSmtpCredentials()) {
+
+            if (smtpConfigured) {
                 val outcome = reporter.generateAndSendReport(
                     employee = current.employee,
                     log = matchingLog,
@@ -1015,15 +1181,17 @@ class AttendanceViewModel(
                     liveSelfiePath = current.liveSelfiePath
                 )
                 if (outcome == EmailReportStatus.SENT) {
-                    offlineStore.markEmailSent(matchingLog.id)
+                    offlineStore.clearPendingCheckOutLock(matchingLog.id)
                     retryPendingEmailReports()
                     dispatchedViaSmtp = true
                 }
-            }
-
-            if (!dispatchedViaSmtp) {
+            } else {
                 runCatching {
-                    val pdfFile = reporter.generateReportPdfFile(
+                    val existingPdf = current.pdfReportPath
+                        .takeIf { it.isNotBlank() }
+                        ?.let { java.io.File(it) }
+                        ?.takeIf { it.exists() && it.length() > 0L }
+                    val pdfFile = existingPdf ?: reporter.generateReportPdfFile(
                         employee = current.employee,
                         log = matchingLog,
                         eventType = current.eventType,
@@ -1033,6 +1201,7 @@ class AttendanceViewModel(
                         recentDailyLogs = snapshotLogs,
                         liveSelfiePath = current.liveSelfiePath
                     )
+                    offlineStore.updatePendingCheckOutPdfPath(matchingLog.id, pdfFile.absolutePath)
                     val gmailIntent = reporter.buildDeviceGmailShareIntent(
                         pdfFile = pdfFile,
                         employee = current.employee,
@@ -1042,7 +1211,7 @@ class AttendanceViewModel(
                         confidenceScore = current.confidenceScore,
                         syncedToCloud = current.syncedToCloud
                     )
-                    offlineStore.markEmailSent(matchingLog.id)
+                    offlineStore.clearPendingCheckOutLock(matchingLog.id)
                     onLaunchEmailIntent(gmailIntent)
                     openedDeviceShare = true
                 }.onFailure { err ->
@@ -1055,6 +1224,7 @@ class AttendanceViewModel(
                     if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
                         phase.copy(
                             checkOutEmailTriggeredOrSent = true,
+                            isPersistentLock = false,
                             emailEnforcementWarningActive = false,
                             emailReportStatus = if (dispatchedViaSmtp) EmailReportStatus.SENT else EmailReportStatus.QUEUED_OFFLINE
                         )
@@ -1068,19 +1238,21 @@ class AttendanceViewModel(
                 )
                 resetToReady()
             } else {
+                val lockPrompt = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
                 _terminalPhase.update { phase ->
                     if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
                         phase.copy(
                             emailReportStatus = EmailReportStatus.QUEUED_OFFLINE,
+                            isPersistentLock = true,
                             emailEnforcementWarningActive = true,
-                            emailEnforcementMessage = VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
+                            emailEnforcementMessage = lockPrompt
                         )
                     } else {
                         phase
                     }
                 }
-                voiceSpeaker.speak(VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT, flush = true)
-                startCheckOutEmailEnforcementLoop(current.logId)
+                voiceSpeaker.speak(lockPrompt, flush = true)
+                startCheckOutEmailEnforcementLoop(current.logId, lockPrompt)
             }
         }
     }
@@ -1176,7 +1348,7 @@ class AttendanceViewModel(
             if (outcome == EmailReportStatus.QUEUED_OFFLINE) {
                 offlineStore.markEmailPending(log.id)
             } else if (outcome == EmailReportStatus.SENT) {
-                offlineStore.markEmailSent(log.id)
+                offlineStore.clearPendingCheckOutLock(log.id)
                 emailReminderJob?.cancel()
                 retryPendingEmailReports()
                 voiceSpeaker.speak(
@@ -1184,19 +1356,30 @@ class AttendanceViewModel(
                     flush = false
                 )
             }
+            val lockFailedCheckOut = outcome != EmailReportStatus.SENT && eventType == AttendanceEventType.CHECK_OUT
             _terminalPhase.update { current ->
                 if (current is TerminalUiPhase.Verified && current.logId == log.id) {
                     current.copy(
                         emailReportStatus = outcome,
                         checkOutEmailTriggeredOrSent = outcome == EmailReportStatus.SENT || current.checkOutEmailTriggeredOrSent,
-                        emailEnforcementWarningActive = if (outcome == EmailReportStatus.SENT) false else current.emailEnforcementWarningActive
+                        isPersistentLock = if (outcome == EmailReportStatus.SENT) false else (current.isPersistentLock || lockFailedCheckOut),
+                        emailEnforcementWarningActive = if (outcome == EmailReportStatus.SENT) false else lockFailedCheckOut,
+                        emailEnforcementMessage = if (lockFailedCheckOut) {
+                            VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
+                        } else {
+                            current.emailEnforcementMessage
+                        }
                     )
                 } else {
                     current
                 }
             }
-            if (outcome != EmailReportStatus.SENT && eventType == AttendanceEventType.CHECK_OUT) {
-                startCheckOutEmailEnforcementLoop(log.id)
+            if (lockFailedCheckOut) {
+                voiceSpeaker.speak(VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT, flush = true)
+                startCheckOutEmailEnforcementLoop(
+                    logId = log.id,
+                    promptMessage = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
+                )
             }
             if (rescheduleResetAfter && outcome == EmailReportStatus.SENT) {
                 scheduleAutoResetToReady()
@@ -1250,9 +1433,14 @@ class AttendanceViewModel(
     }
 
     fun resetToReady() {
+        val activeLock = offlineStore.pendingCheckOutLock.value
         val activeVerified = _terminalPhase.value as? TerminalUiPhase.Verified
         if (activeVerified != null && !activeVerified.isCheckOutEmailCompleted) {
             attemptSkipOrDismissCheckOut()
+            return
+        }
+        if (activeLock != null) {
+            restorePhaseFromPendingLock(activeLock, triggerVoice = true)
             return
         }
         scanTimerJob?.cancel()

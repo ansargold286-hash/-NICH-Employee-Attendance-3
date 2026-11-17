@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#050A14" />
-  <meta name="description" content="NICH Employee Attendance 3 — Standalone Biometric Face-Scanning Web Terminal" />
-  <title>NICH Employee Attendance 3</title>
+  <meta name="description" content="NICH Employee Attendance 3 v2.0 — Standalone Biometric Face-Scanning Web Terminal" />
+  <title>NICH Employee Attendance 3 • v2.0</title>
   <link rel="icon" type="image/png" href="./assets/nich_official_logo.png" />
   <link rel="apple-touch-icon" href="./assets/nich_official_logo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -96,8 +96,8 @@
         <!-- Shown ONLY on Check-Out (hidden on Check-In) -->
         <div id="checkOutActions" class="checkout-actions hidden">
           <div id="emailEnforcementBanner" class="enforcement-banner hidden" role="alert">
-            <strong class="enforcement-title">Mandatory Check-Out Email Required</strong>
-            <p class="enforcement-body">
+            <strong id="enforcementTitle" class="enforcement-title">Mandatory Check-Out Email Required</strong>
+            <p id="enforcementBody" class="enforcement-body">
               Please send the email! Without sending the email, your attendance and record will not be saved.
             </p>
           </div>
@@ -152,8 +152,8 @@
           <div class="operator-brand">
             <img src="./assets/nich_official_logo.png" alt="NICH Logo" width="38" height="38" />
             <div>
-              <h2 id="operatorDrawerTitle" class="operator-title">NICH Attendance 3</h2>
-              <p class="operator-subtitle">GitHub Pages Web Adapter • Firebase Cloud Sync</p>
+              <h2 id="operatorDrawerTitle" class="operator-title">NICH Attendance 3 • v2.0</h2>
+              <p class="operator-subtitle">Build 2 • GitHub Pages Web Adapter • Cloud Sync</p>
             </div>
           </div>
           <button id="closeOperatorDrawerBtn" type="button" class="btn-icon-close" aria-label="Close">

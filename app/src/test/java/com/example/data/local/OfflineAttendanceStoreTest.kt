@@ -8,6 +8,7 @@ import com.example.data.model.VerificationMethod
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -160,5 +161,53 @@ class OfflineAttendanceStoreTest {
             tempPhoto1.delete()
             tempPhoto2.delete()
         }
+    }
+
+    @Test
+    fun pendingCheckOutLock_persistsLivePhotoGpsNtpAndPdfAcrossStoreRecreation_andClearsOnlyOnUnlock() {
+        val store = OfflineAttendanceStore(context)
+        assertFalse(store.isCheckOutEmailLocked)
+        assertNull(store.pendingCheckOutLock.value)
+
+        store.savePendingCheckOutLock(
+            PendingCheckOutLock(
+                logId = "log_checkout_locked_1",
+                employeeId = "emp_bilal",
+                employeeCode = "NICH-4001",
+                employeeName = "Bilal Ahmed",
+                department = "Engineering",
+                verificationMethod = "FACE_SCAN_1",
+                confidenceScore = 95,
+                loggedTimeLabel = "05:45:00 PM",
+                loggedDateKey = "2026-11-17",
+                gpsCoordinates = "24.860734, 67.001136 (±8m)",
+                locationAddress = "NICH Campus, Karachi",
+                timeSource = "NTP Verified (time.google.com)",
+                liveSelfiePath = "/tmp/selfie_checkout.jpg",
+                pdfReportPath = ""
+            )
+        )
+        store.updatePendingCheckOutPdfPath("log_checkout_locked_1", "/tmp/report_checkout.pdf")
+
+        // Simulate app process kill & cold relaunch with a fresh OfflineAttendanceStore instance
+        val restartedStore = OfflineAttendanceStore(context)
+        assertTrue(restartedStore.isCheckOutEmailLocked)
+        val restored = restartedStore.pendingCheckOutLock.value
+        assertNotNull(restored)
+        assertEquals("log_checkout_locked_1", restored!!.logId)
+        assertEquals("Bilal Ahmed", restored.employeeName)
+        assertEquals("24.860734, 67.001136 (±8m)", restored.gpsCoordinates)
+        assertEquals("NICH Campus, Karachi", restored.locationAddress)
+        assertEquals("NTP Verified (time.google.com)", restored.timeSource)
+        assertEquals("/tmp/selfie_checkout.jpg", restored.liveSelfiePath)
+        assertEquals("/tmp/report_checkout.pdf", restored.pdfReportPath)
+        assertTrue("log_checkout_locked_1" in restartedStore.pendingEmailLogIds.value)
+
+        // Unlock only after confirmation clear
+        restartedStore.clearPendingCheckOutLock("log_checkout_locked_1")
+        val unlockedStore = OfflineAttendanceStore(context)
+        assertFalse(unlockedStore.isCheckOutEmailLocked)
+        assertNull(unlockedStore.pendingCheckOutLock.value)
+        assertFalse("log_checkout_locked_1" in unlockedStore.pendingEmailLogIds.value)
     }
 }

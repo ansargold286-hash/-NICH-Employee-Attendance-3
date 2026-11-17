@@ -63,6 +63,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.BuildConfig
 import com.example.R
 import com.example.data.local.LocalRegistrationInput
 import com.example.data.model.Employee
@@ -166,9 +167,9 @@ fun EmployeeRegistrationScreen(
                         )
                         Text(
                             text = if (enrolledSaved.isEmpty()) {
-                                "First-Time Setup • Add all staff members once"
+                                "v${BuildConfig.VERSION_NAME} • First-Time Setup • Add staff once"
                             } else {
-                                "Local Storage • ${enrolledSaved.size} Face Profile(s) Enrolled"
+                                "v${BuildConfig.VERSION_NAME} • ${enrolledSaved.size} Face Profile(s) Enrolled"
                             },
                             style = MaterialTheme.typography.labelMedium,
                             color = TextSecondary,

@@ -27,6 +27,27 @@ data class LocalRegistrationInput(
     val faceSignature: String
 )
 
+data class PendingCheckOutLock(
+    val logId: String,
+    val employeeId: String,
+    val employeeCode: String,
+    val employeeName: String,
+    val department: String,
+    val roleTitle: String = "Authorized Staff",
+    val avatarKey: String = "avatar_1",
+    val localEmployeePhotoPath: String = "",
+    val verificationMethod: String,
+    val confidenceScore: Int,
+    val loggedTimeLabel: String,
+    val loggedDateKey: String,
+    val gpsCoordinates: String = "",
+    val locationAddress: String = "",
+    val timeSource: String = "",
+    val liveSelfiePath: String = "",
+    val pdfReportPath: String = "",
+    val lockedAtMillis: Long = System.currentTimeMillis()
+)
+
 class OfflineAttendanceStore(context: Context) {
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -48,6 +69,12 @@ class OfflineAttendanceStore(context: Context) {
 
     private val _pendingEmailLogIds = MutableStateFlow(loadStringSet(KEY_PENDING_EMAIL_LOG_IDS))
     val pendingEmailLogIds: StateFlow<Set<String>> = _pendingEmailLogIds.asStateFlow()
+
+    private val _pendingCheckOutLock = MutableStateFlow(loadPendingCheckOutLock())
+    val pendingCheckOutLock: StateFlow<PendingCheckOutLock?> = _pendingCheckOutLock.asStateFlow()
+
+    val isCheckOutEmailLocked: Boolean
+        get() = _pendingCheckOutLock.value != null
 
     fun hasRegisteredFaceProfiles(): Boolean {
         return _employees.value.any { emp ->
@@ -355,14 +382,46 @@ class OfflineAttendanceStore(context: Context) {
         if (logId in _pendingEmailLogIds.value) return
         val updated = _pendingEmailLogIds.value + logId
         _pendingEmailLogIds.value = updated
-        persistStringSet(KEY_PENDING_EMAIL_LOG_IDS, updated)
+        persistStringSetSync(KEY_PENDING_EMAIL_LOG_IDS, updated)
     }
 
     fun markEmailSent(logId: String) {
-        if (logId !in _pendingEmailLogIds.value) return
-        val updated = _pendingEmailLogIds.value - logId
-        _pendingEmailLogIds.value = updated
-        persistStringSet(KEY_PENDING_EMAIL_LOG_IDS, updated)
+        if (logId in _pendingEmailLogIds.value) {
+            val updated = _pendingEmailLogIds.value - logId
+            _pendingEmailLogIds.value = updated
+            persistStringSetSync(KEY_PENDING_EMAIL_LOG_IDS, updated)
+        }
+        if (_pendingCheckOutLock.value?.logId == logId) {
+            clearPendingCheckOutLock(logId)
+        }
+    }
+
+    fun savePendingCheckOutLock(lock: PendingCheckOutLock) {
+        _pendingCheckOutLock.value = lock
+        persistPendingCheckOutLock(lock)
+        markEmailPending(lock.logId)
+    }
+
+    fun updatePendingCheckOutPdfPath(logId: String, pdfReportPath: String) {
+        val current = _pendingCheckOutLock.value ?: return
+        if (current.logId != logId || pdfReportPath.isBlank()) return
+        val updated = current.copy(pdfReportPath = pdfReportPath)
+        _pendingCheckOutLock.value = updated
+        persistPendingCheckOutLock(updated)
+    }
+
+    fun clearPendingCheckOutLock(logId: String? = null) {
+        val current = _pendingCheckOutLock.value
+        if (current != null && (logId == null || current.logId == logId)) {
+            _pendingCheckOutLock.value = null
+            prefs.edit(commit = true) { remove(KEY_PENDING_CHECKOUT_LOCK_JSON) }
+        }
+        val idToClear = logId ?: current?.logId
+        if (!idToClear.isNullOrBlank() && idToClear in _pendingEmailLogIds.value) {
+            val updated = _pendingEmailLogIds.value - idToClear
+            _pendingEmailLogIds.value = updated
+            persistStringSetSync(KEY_PENDING_EMAIL_LOG_IDS, updated)
+        }
     }
 
     fun mergeRemoteEmployees(remoteEmployees: List<Employee>) {
@@ -521,12 +580,72 @@ class OfflineAttendanceStore(context: Context) {
         prefs.edit { putString(KEY_LOGS, arr.toString()) }
     }
 
+    private fun loadPendingCheckOutLock(): PendingCheckOutLock? {
+        val raw = prefs.getString(KEY_PENDING_CHECKOUT_LOCK_JSON, null) ?: return null
+        return try {
+            val obj = JSONObject(raw)
+            val logId = obj.optString("logId")
+            val empName = obj.optString("employeeName")
+            if (logId.isBlank() || empName.isBlank()) return null
+            PendingCheckOutLock(
+                logId = logId,
+                employeeId = obj.optString("employeeId"),
+                employeeCode = obj.optString("employeeCode"),
+                employeeName = empName,
+                department = obj.optString("department", "Authorized Staff"),
+                roleTitle = obj.optString("roleTitle", "Authorized Staff"),
+                avatarKey = obj.optString("avatarKey", "avatar_1"),
+                localEmployeePhotoPath = obj.optString("localEmployeePhotoPath"),
+                verificationMethod = obj.optString("verificationMethod", VerificationMethod.FACE_SCAN_1.wireValue),
+                confidenceScore = obj.optInt("confidenceScore", 90),
+                loggedTimeLabel = obj.optString("loggedTimeLabel"),
+                loggedDateKey = obj.optString("loggedDateKey"),
+                gpsCoordinates = obj.optString("gpsCoordinates"),
+                locationAddress = obj.optString("locationAddress"),
+                timeSource = obj.optString("timeSource"),
+                liveSelfiePath = obj.optString("liveSelfiePath"),
+                pdfReportPath = obj.optString("pdfReportPath"),
+                lockedAtMillis = obj.optLong("lockedAtMillis", System.currentTimeMillis())
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun persistPendingCheckOutLock(lock: PendingCheckOutLock) {
+        val obj = JSONObject().apply {
+            put("logId", lock.logId)
+            put("employeeId", lock.employeeId)
+            put("employeeCode", lock.employeeCode)
+            put("employeeName", lock.employeeName)
+            put("department", lock.department)
+            put("roleTitle", lock.roleTitle)
+            put("avatarKey", lock.avatarKey)
+            put("localEmployeePhotoPath", lock.localEmployeePhotoPath)
+            put("verificationMethod", lock.verificationMethod)
+            put("confidenceScore", lock.confidenceScore)
+            put("loggedTimeLabel", lock.loggedTimeLabel)
+            put("loggedDateKey", lock.loggedDateKey)
+            put("gpsCoordinates", lock.gpsCoordinates)
+            put("locationAddress", lock.locationAddress)
+            put("timeSource", lock.timeSource)
+            put("liveSelfiePath", lock.liveSelfiePath)
+            put("pdfReportPath", lock.pdfReportPath)
+            put("lockedAtMillis", lock.lockedAtMillis)
+        }
+        prefs.edit(commit = true) { putString(KEY_PENDING_CHECKOUT_LOCK_JSON, obj.toString()) }
+    }
+
     private fun loadStringSet(key: String): Set<String> {
         return prefs.getStringSet(key, emptySet())?.toSet() ?: emptySet()
     }
 
     private fun persistStringSet(key: String, ids: Set<String>) {
         prefs.edit { putStringSet(key, ids) }
+    }
+
+    private fun persistStringSetSync(key: String, ids: Set<String>) {
+        prefs.edit(commit = true) { putStringSet(key, ids) }
     }
 
     companion object {
@@ -538,6 +657,7 @@ class OfflineAttendanceStore(context: Context) {
         private const val KEY_PENDING_EMPLOYEE_IDS = "pending_employee_ids"
         private const val KEY_PENDING_DELETE_EMPLOYEE_IDS = "pending_delete_employee_ids"
         private const val KEY_PENDING_EMAIL_LOG_IDS = "pending_email_log_ids"
+        private const val KEY_PENDING_CHECKOUT_LOCK_JSON = "pending_checkout_lock_json"
         private const val KEY_LOG_SELFIES_JSON = "log_selfies_json"
         private const val KEY_REGISTRATION_COMPLETED = "local_registration_completed"
         private const val MAX_LOCAL_LOGS = 400

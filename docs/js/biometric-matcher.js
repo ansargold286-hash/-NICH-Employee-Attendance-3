@@ -11,7 +11,8 @@ export const DEFAULT_ANSAR_FACE_SIGNATURE =
 const STORAGE_KEYS = {
   EMPLOYEES: 'nich3_web_employees_v1',
   LOGS: 'nich3_web_logs_v1',
-  PENDING_LOG_IDS: 'nich3_web_pending_log_ids_v1'
+  PENDING_LOG_IDS: 'nich3_web_pending_log_ids_v1',
+  PENDING_CHECKOUT_LOCK: 'nich3_web_pending_checkout_lock_v1'
 };
 
 export function defaultPreRegisteredEmployees() {
@@ -398,6 +399,21 @@ export function createWebAttendanceStore() {
       saveJson(STORAGE_KEYS.PENDING_LOG_IDS, Array.from(pendingLogIds));
       logs = logs.map((l) => (l.id === logId ? { ...l, syncedToCloud: true } : l));
       saveJson(STORAGE_KEYS.LOGS, logs);
+    },
+    getPendingCheckOutLock() {
+      return loadJson(STORAGE_KEYS.PENDING_CHECKOUT_LOCK, null);
+    },
+    savePendingCheckOutLock(payload) {
+      if (!payload || !payload.logEntry) return null;
+      saveJson(STORAGE_KEYS.PENDING_CHECKOUT_LOCK, payload);
+      return payload;
+    },
+    clearPendingCheckOutLock() {
+      try {
+        localStorage.removeItem(STORAGE_KEYS.PENDING_CHECKOUT_LOCK);
+      } catch {
+        // Ignore storage error gracefully
+      }
     }
   };
 }

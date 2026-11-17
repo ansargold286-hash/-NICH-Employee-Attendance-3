@@ -101,6 +101,9 @@ object VoicePromptScript {
     const val MANDATORY_EMAIL_ENFORCEMENT_PROMPT =
         "Please send the email! Without sending the email, your attendance and record will not be saved."
 
+    const val PENDING_CHECKOUT_LOCK_PROMPT =
+        "Pending Check-Out email not sent! Please send the attendance report to proceed."
+
     const val REQUIRED_PERMISSIONS_WARNING_PROMPT =
         "Please allow required permissions!"
 

@@ -56,6 +56,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.BuildConfig
 import com.example.R
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.FaceAnalysisFrame
@@ -186,6 +187,13 @@ fun TerminalDashboardScreen(
                         textAlign = TextAlign.Center,
                         modifier = Modifier.testTag("network_time_lock_badge")
                     )
+                    Text(
+                        text = "NICH Attendance 3 • v${BuildConfig.VERSION_NAME} (Build ${BuildConfig.VERSION_CODE})",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = NeonCyan.copy(alpha = 0.85f),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.testTag("app_version_badge")
+                    )
                 }
             }
         }
@@ -264,7 +272,7 @@ private fun VerificationSuccessOverlay(
         }
     }
 
-    val cardBorderColor = if (phase.emailEnforcementWarningActive) NeonRed else accent
+    val cardBorderColor = if (phase.emailEnforcementWarningActive || phase.isPersistentLock) NeonRed else accent
 
     Box(
         modifier = Modifier
@@ -459,7 +467,8 @@ private fun VerificationSuccessOverlay(
                 if (phase.eventType == AttendanceEventType.CHECK_OUT) {
                     val isSending = phase.emailReportStatus == EmailReportStatus.DISPATCHING
                     val isSent = phase.emailReportStatus == EmailReportStatus.SENT
-                    val showBlockingBanner = phase.emailEnforcementWarningActive && !phase.isCheckOutEmailCompleted
+                    val showBlockingBanner = (phase.emailEnforcementWarningActive || phase.isPersistentLock) &&
+                        !phase.isCheckOutEmailCompleted
 
                     if (showBlockingBanner) {
                         Surface(
@@ -479,24 +488,41 @@ private fun VerificationSuccessOverlay(
                             ) {
                                 Icon(
                                     imageVector = Icons.Rounded.WarningAmber,
-                                    contentDescription = stringResource(R.string.email_enforcement_title),
+                                    contentDescription = stringResource(
+                                        if (phase.isPersistentLock) R.string.pending_checkout_lock_title
+                                        else R.string.email_enforcement_title
+                                    ),
                                     tint = NeonRed,
                                     modifier = Modifier.size(22.dp)
                                 )
                                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                     Text(
-                                        text = stringResource(R.string.email_enforcement_title),
+                                        text = stringResource(
+                                            if (phase.isPersistentLock) R.string.pending_checkout_lock_title
+                                            else R.string.email_enforcement_title
+                                        ),
                                         style = MaterialTheme.typography.labelMedium,
                                         color = NeonRed,
                                         fontWeight = FontWeight.Bold
                                     )
                                     Text(
                                         text = phase.emailEnforcementMessage
-                                            ?: stringResource(R.string.email_enforcement_blocking_message),
+                                            ?: stringResource(
+                                                if (phase.isPersistentLock) R.string.pending_checkout_lock_message
+                                                else R.string.email_enforcement_blocking_message
+                                            ),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = TextPrimary,
                                         fontWeight = FontWeight.Medium
                                     )
+                                    if (phase.isPersistentLock) {
+                                        Text(
+                                            text = stringResource(R.string.offline_lock_badge),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = NeonCyan,
+                                            modifier = Modifier.testTag("offline_lock_saved_badge")
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -528,6 +554,7 @@ private fun VerificationSuccessOverlay(
                             text = when {
                                 isSent -> "Email Sent • Finish"
                                 isSending -> stringResource(R.string.dispatching_email_and_finishing)
+                                phase.isPersistentLock -> stringResource(R.string.retry_send_checkout_email)
                                 else -> stringResource(R.string.send_email_and_finish)
                             },
                             fontWeight = FontWeight.Bold,

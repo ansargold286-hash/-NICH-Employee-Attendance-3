@@ -14,6 +14,8 @@ const FRAME_ANALYSIS_INTERVAL_MS = 240;
 const EMAIL_ENFORCEMENT_INTERVAL_MS = 6000;
 const MANDATORY_EMAIL_ENFORCEMENT_PROMPT =
   'Please send the email! Without sending the email, your attendance and record will not be saved.';
+const PENDING_CHECKOUT_LOCK_PROMPT =
+  'Pending Check-Out email not sent! Please send the attendance report to proceed.';
 
 const els = {
   video: document.getElementById('cameraVideo'),
@@ -29,6 +31,8 @@ const els = {
   verifiedMeta: document.getElementById('verifiedMeta'),
   checkOutActions: document.getElementById('checkOutActions'),
   emailEnforcementBanner: document.getElementById('emailEnforcementBanner'),
+  enforcementTitle: document.getElementById('enforcementTitle'),
+  enforcementBody: document.getElementById('enforcementBody'),
   sendEmailFinishBtn: document.getElementById('sendEmailFinishBtn'),
   sendEmailBtnLabel: document.getElementById('sendEmailBtnLabel'),
   cameraFailureOverlay: document.getElementById('cameraFailureOverlay'),
@@ -136,6 +140,10 @@ function startFrameAnalysisLoop() {
 }
 
 async function runSingleFrameCheck() {
+  if (store.getPendingCheckOutLock()) {
+    restorePendingWebCheckOutLock(false);
+    return;
+  }
   if (state.phase !== 'SCANNING' || state.drawerOpen || state.analysisInFlight) {
     return;
   }
@@ -210,9 +218,16 @@ async function commitVerifiedAttendance(employee, confidenceScore, selfieDataUrl
     synced: false
   });
 
-  state.currentVerifiedPayload = { employee, logEntry, selfieDataUrl };
+  state.currentVerifiedPayload = { employee, logEntry, selfieDataUrl, isPersistentLock: false };
   state.checkOutEmailCompleted = eventType !== 'CHECK_OUT';
-  renderVerifiedOverlay(employee, logEntry, selfieDataUrl);
+  if (eventType === 'CHECK_OUT') {
+    store.savePendingCheckOutLock({
+      employee,
+      logEntry,
+      selfieDataUrl
+    });
+  }
+  renderVerifiedOverlay(employee, logEntry, selfieDataUrl, false);
   refreshOperatorDrawer();
 
   speakWebVoicePrompt(
@@ -250,11 +265,22 @@ async function commitVerifiedAttendance(employee, confidenceScore, selfieDataUrl
   }
 }
 
-function triggerCheckOutEnforcementWarning() {
+function triggerCheckOutEnforcementWarning(customMessage = null) {
   if (state.phase !== 'VERIFIED' || state.checkOutEmailCompleted) return;
+  const activePrompt =
+    customMessage ||
+    (state.currentVerifiedPayload?.isPersistentLock
+      ? PENDING_CHECKOUT_LOCK_PROMPT
+      : MANDATORY_EMAIL_ENFORCEMENT_PROMPT);
+  if (els.enforcementTitle && els.enforcementBody) {
+    els.enforcementTitle.textContent = state.currentVerifiedPayload?.isPersistentLock
+      ? 'Attendance Locked • Pending Check-Out Email'
+      : 'Mandatory Check-Out Email Required';
+    els.enforcementBody.textContent = activePrompt;
+  }
   els.verifiedCard.classList.add('is-enforcement-alert');
   els.emailEnforcementBanner.classList.remove('hidden');
-  speakWebVoicePrompt(MANDATORY_EMAIL_ENFORCEMENT_PROMPT, true);
+  speakWebVoicePrompt(activePrompt, true);
 }
 
 function startWebCheckOutEnforcementLoop() {
@@ -269,12 +295,36 @@ function startWebCheckOutEnforcementLoop() {
   }, EMAIL_ENFORCEMENT_INTERVAL_MS);
 }
 
-function renderVerifiedOverlay(employee, logEntry, selfieDataUrl) {
+function restorePendingWebCheckOutLock(speakNow = true) {
+  const savedLock = store.getPendingCheckOutLock();
+  if (!savedLock || !savedLock.employee || !savedLock.logEntry) return false;
+  clearTimeout(state.resetTimer);
+  state.phase = 'VERIFIED';
+  state.checkOutEmailCompleted = false;
+  state.currentVerifiedPayload = {
+    employee: savedLock.employee,
+    logEntry: savedLock.logEntry,
+    selfieDataUrl: savedLock.selfieDataUrl || null,
+    isPersistentLock: true
+  };
+  renderVerifiedOverlay(savedLock.employee, savedLock.logEntry, savedLock.selfieDataUrl || null, true);
+  if (speakNow) {
+    triggerCheckOutEnforcementWarning(PENDING_CHECKOUT_LOCK_PROMPT);
+  }
+  startWebCheckOutEnforcementLoop();
+  return true;
+}
+
+function renderVerifiedOverlay(employee, logEntry, selfieDataUrl, isPersistentLock = false) {
   const isCheckOut = logEntry.eventType === 'CHECK_OUT';
   els.verifiedCard.classList.toggle('is-checkout', isCheckOut);
-  els.verifiedCard.classList.remove('is-enforcement-alert');
+  els.verifiedCard.classList.toggle('is-enforcement-alert', Boolean(isPersistentLock));
   els.closeCheckOutOverlayBtn.classList.toggle('hidden', !isCheckOut);
-  els.emailEnforcementBanner.classList.add('hidden');
+  els.emailEnforcementBanner.classList.toggle('hidden', !isPersistentLock);
+  if (isPersistentLock && els.enforcementTitle && els.enforcementBody) {
+    els.enforcementTitle.textContent = 'Attendance Locked • Pending Check-Out Email';
+    els.enforcementBody.textContent = PENDING_CHECKOUT_LOCK_PROMPT;
+  }
   els.verifiedEmployeeName.textContent = employee.name;
   els.verifiedMeta.textContent = `${AttendanceTimeRules.displayLabel(logEntry.eventType)} • ${logEntry.loggedTimeLabel}`;
 
@@ -288,7 +338,9 @@ function renderVerifiedOverlay(employee, logEntry, selfieDataUrl) {
 
   els.checkOutActions.classList.toggle('hidden', !isCheckOut);
   els.sendEmailFinishBtn.disabled = false;
-  els.sendEmailBtnLabel.textContent = 'Send Email & Finish';
+  els.sendEmailBtnLabel.textContent = isPersistentLock
+    ? 'Send Pending Email & Unlock'
+    : 'Send Email & Finish';
 
   els.verifiedOverlay.classList.remove('hidden');
 }
@@ -424,6 +476,7 @@ document.addEventListener('keydown', (e) => {
 els.sendEmailFinishBtn.addEventListener('click', async () => {
   const payload = state.currentVerifiedPayload;
   if (!payload) {
+    store.clearPendingCheckOutLock();
     state.checkOutEmailCompleted = true;
     resetToScanning();
     return;
@@ -437,13 +490,16 @@ els.sendEmailFinishBtn.addEventListener('click', async () => {
       selfieDataUrl: payload.selfieDataUrl,
       operatorEmail: state.currentUser?.email || ''
     });
+    store.clearPendingCheckOutLock();
     state.checkOutEmailCompleted = true;
     speakWebVoicePrompt('Check-out email and report sent successfully. Attendance saved.', true);
     resetToScanning();
   } catch {
     els.sendEmailFinishBtn.disabled = false;
-    els.sendEmailBtnLabel.textContent = 'Send Email & Finish';
-    triggerCheckOutEnforcementWarning();
+    els.sendEmailBtnLabel.textContent = payload.isPersistentLock
+      ? 'Send Pending Email & Unlock'
+      : 'Send Email & Finish';
+    triggerCheckOutEnforcementWarning(PENDING_CHECKOUT_LOCK_PROMPT);
   }
 });
 
@@ -504,6 +560,7 @@ firebaseClient.onAuthChanged((user) => {
 
 window.addEventListener('pagehide', stopCameraFeed);
 
-// Immediately launch live camera feed on page boot matching Android standalone terminal
+// Immediately launch live camera feed on page boot and enforce any un-sent Check-Out lock
 refreshOperatorDrawer();
 startCameraFeed();
+restorePendingWebCheckOutLock(true);
