@@ -6,6 +6,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.LocalRegistrationInput
 import com.example.data.local.OfflineAttendanceStore
+import com.example.data.location.LocationAddressProvider
+import com.example.data.location.NoOpLocationAddressProvider
+import com.example.data.model.AntiSpoofingLivenessTracker
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
 import com.example.data.model.AttendanceTimeRules
@@ -18,6 +21,12 @@ import com.example.data.model.VerificationMethod
 import com.example.data.report.AttendanceEmailReporter
 import com.example.data.report.EmailReportStatus
 import com.example.data.repository.AttendanceRepository
+import com.example.data.time.DeviceCalendarTimeProvider
+import com.example.data.time.NetworkTimeProvider
+import com.example.data.time.NetworkTimeSnapshot
+import com.example.voice.NoOpVoiceSpeaker
+import com.example.voice.VoicePromptScript
+import com.example.voice.VoiceSpeaker
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -46,6 +55,8 @@ sealed interface TerminalUiPhase {
         val eyesLocked: Boolean = false,
         val noseMustacheLocked: Boolean = false,
         val jawBeardLocked: Boolean = false,
+        val livenessVerified: Boolean = false,
+        val spoofSuspected: Boolean = false,
         val livenessSteps: List<LivenessDirection> = listOf(
             LivenessDirection.TURN_LEFT,
             LivenessDirection.TURN_RIGHT,
@@ -64,9 +75,20 @@ sealed interface TerminalUiPhase {
         val syncedToCloud: Boolean,
         val logId: String = "",
         val liveSelfiePath: String? = null,
+        val gpsCoordinates: String = "",
+        val locationAddress: String = "",
+        val timeSourceLabel: String = "",
         val deviceSenderAccount: String? = null,
-        val emailReportStatus: EmailReportStatus = EmailReportStatus.NEEDS_CONFIG
-    ) : TerminalUiPhase
+        val emailReportStatus: EmailReportStatus = EmailReportStatus.NEEDS_CONFIG,
+        val emailEnforcementWarningActive: Boolean = false,
+        val emailEnforcementMessage: String? = null,
+        val checkOutEmailTriggeredOrSent: Boolean = false
+    ) : TerminalUiPhase {
+        val isCheckOutEmailCompleted: Boolean
+            get() = eventType != AttendanceEventType.CHECK_OUT ||
+                checkOutEmailTriggeredOrSent ||
+                emailReportStatus == EmailReportStatus.SENT
+    }
 
     data class Failure(
         val title: String,
@@ -97,7 +119,10 @@ class AttendanceViewModel(
     autoInitBackgroundJobs: Boolean = true,
     private val calendarProvider: () -> Calendar = { Calendar.getInstance() },
     private val continuousKioskMode: Boolean = true,
-    private val sameEmployeeCooldownMs: Long = 3_000L
+    private val sameEmployeeCooldownMs: Long = 3_000L,
+    private val voiceSpeaker: VoiceSpeaker = NoOpVoiceSpeaker,
+    private val networkTimeProvider: NetworkTimeProvider? = null,
+    private val locationProvider: LocationAddressProvider = NoOpLocationAddressProvider
 ) : ViewModel() {
 
     val employeesState: StateFlow<DataUiState<List<Employee>>> =
@@ -143,7 +168,13 @@ class AttendanceViewModel(
     )
     val showRegistrationScreen: StateFlow<Boolean> = _showRegistrationScreen.asStateFlow()
 
-    private val _clock = MutableStateFlow(buildClockSnapshot(calendarProvider()))
+    private val activeTimeProvider: NetworkTimeProvider =
+        networkTimeProvider ?: DeviceCalendarTimeProvider(calendarProvider)
+
+    private val _networkTimeStatus = MutableStateFlow(activeTimeProvider.currentSnapshot())
+    val networkTimeStatus: StateFlow<NetworkTimeSnapshot> = _networkTimeStatus.asStateFlow()
+
+    private val _clock = MutableStateFlow(buildClockSnapshot(activeTimeProvider.currentCalendar()))
     val clock: StateFlow<ClockSnapshot> = _clock.asStateFlow()
 
     private fun buildClockSnapshot(now: Calendar): ClockSnapshot {
@@ -159,6 +190,7 @@ class AttendanceViewModel(
     private var scanTimerJob: Job? = null
     private var resetTimerJob: Job? = null
     private var emailDispatchJob: Job? = null
+    private var emailReminderJob: Job? = null
     private var scanMatchInFlight = false
     private var consecutiveMatchCount = 0
     private var livenessHoldCount = 0
@@ -169,11 +201,32 @@ class AttendanceViewModel(
     private var analyzedFaceFrames = 0
     private var rejectedFaceFrames = 0
     private var highestRejectedConfidence = 0
+    private var lastVoicePromptKey: String? = null
+    private var lastVoicePromptAtMs: Long = 0L
+    private var welcomeSpokenAtMs: Long = 0L
+    private val antiSpoofingTracker = AntiSpoofingLivenessTracker()
 
     init {
         if (autoInitBackgroundJobs) {
             viewModelScope.launch {
                 offlineStore.calibrateRegisteredReferenceFaces()
+            }
+
+            viewModelScope.launch {
+                while (isActive) {
+                    val synced = runCatching { activeTimeProvider.syncNow() }.getOrNull()
+                    if (synced != null) {
+                        _networkTimeStatus.value = synced
+                        if (synced.tamperingDetected) {
+                            speakScanGuidance(
+                                key = "clock_tamper",
+                                message = VoicePromptScript.clockTamperDetectedPrompt(),
+                                minIntervalMs = 60_000L
+                            )
+                        }
+                    }
+                    delay(5 * 60 * 1000L)
+                }
             }
 
             if (repository != null && !currentUserId.isNullOrBlank()) {
@@ -186,7 +239,8 @@ class AttendanceViewModel(
 
             viewModelScope.launch {
                 while (isActive) {
-                    _clock.value = buildClockSnapshot(calendarProvider())
+                    _networkTimeStatus.value = activeTimeProvider.currentSnapshot()
+                    _clock.value = buildClockSnapshot(activeTimeProvider.currentCalendar())
                     delay(1000L)
                 }
             }
@@ -285,7 +339,10 @@ class AttendanceViewModel(
                 confidenceScore = log.confidenceScore.toInt(),
                 loggedTimeLabel = log.loggedTimeLabel,
                 loggedDateKey = log.loggedDateKey,
-                explicitLogId = log.id
+                explicitLogId = log.id,
+                gpsCoordinates = log.gpsCoordinates,
+                locationAddress = log.locationAddress,
+                timeSource = log.timeSource
             )
             if (res.isSuccess) {
                 offlineStore.markLogSynced(log.id)
@@ -340,6 +397,7 @@ class AttendanceViewModel(
     fun openRegistrationScreen() {
         scanTimerJob?.cancel()
         resetTimerJob?.cancel()
+        emailReminderJob?.cancel()
         scanMatchInFlight = false
         consecutiveMatchCount = 0
         lastMatchedEmployeeId = null
@@ -352,6 +410,7 @@ class AttendanceViewModel(
             livenessSequence = listOf(LivenessDirection.CENTER_VERIFY),
             preserveCameraReady = false
         )
+        speakWelcomeIfNeeded(force = true)
     }
 
     fun registerEmployeesBatch(inputs: List<LocalRegistrationInput>) {
@@ -406,6 +465,7 @@ class AttendanceViewModel(
         analyzedFaceFrames = 0
         rejectedFaceFrames = 0
         highestRejectedConfidence = 0
+        antiSpoofingTracker.reset()
 
         _terminalPhase.value = TerminalUiPhase.Scanning(
             attempt = 1,
@@ -437,6 +497,10 @@ class AttendanceViewModel(
             } else {
                 phase
             }
+        }
+
+        if (!_showRegistrationScreen.value) {
+            speakWelcomeIfNeeded(force = false)
         }
 
         if (continuousKioskMode) return
@@ -494,6 +558,8 @@ class AttendanceViewModel(
     fun onLiveFaceFrameAnalyzed(frame: FaceAnalysisFrame) {
         val current = _terminalPhase.value as? TerminalUiPhase.Scanning ?: return
 
+        val livenessResult = antiSpoofingTracker.evaluate(frame)
+
         _terminalPhase.update { phase ->
             if (phase is TerminalUiPhase.Scanning) {
                 phase.copy(
@@ -501,6 +567,8 @@ class AttendanceViewModel(
                     eyesLocked = frame.eyesLocked,
                     noseMustacheLocked = frame.noseMustacheLocked,
                     jawBeardLocked = frame.jawBeardLocked,
+                    livenessVerified = livenessResult.livenessVerified,
+                    spoofSuspected = livenessResult.spoofSuspected,
                     qualityHint = frame.qualityIssue
                 )
             } else {
@@ -520,6 +588,7 @@ class AttendanceViewModel(
 
         // Evaluate directional liveness step before advancing to frontal biometric match & selfie capture
         if (activeDirection != LivenessDirection.CENTER_VERIFY) {
+            speakScanGuidance("liveness_${activeDirection.name}", VoicePromptScript.directionalLivenessPrompt(activeDirection))
             val directionPassed = LivenessEvaluator.isDirectionSatisfied(
                 direction = activeDirection,
                 headYawDeg = frame.headYawDeg,
@@ -543,6 +612,11 @@ class AttendanceViewModel(
                             phase
                         }
                     }
+                    speakScanGuidance(
+                        key = "liveness_${nextDirection.name}",
+                        message = VoicePromptScript.directionalLivenessPrompt(nextDirection),
+                        minIntervalMs = 1_500L
+                    )
                 }
             } else {
                 livenessHoldCount = 0
@@ -560,6 +634,33 @@ class AttendanceViewModel(
                 } else {
                     phase
                 }
+            }
+            speakScanGuidance("alignment_guide", VoicePromptScript.alignmentGuidePrompt())
+            return
+        }
+
+        // Strict Anti-Spoofing Gate: reject static printed photos & mobile phone screenshots
+        if (!livenessResult.livenessVerified) {
+            consecutiveMatchCount = 0
+            _terminalPhase.update { phase ->
+                if (phase is TerminalUiPhase.Scanning) {
+                    phase.copy(
+                        livenessVerified = false,
+                        spoofSuspected = livenessResult.spoofSuspected,
+                        qualityHint = livenessResult.statusPrompt
+                    )
+                } else {
+                    phase
+                }
+            }
+            if (livenessResult.spoofSuspected) {
+                speakScanGuidance(
+                    key = "spoof_alert",
+                    message = VoicePromptScript.spoofDetectedPrompt(),
+                    urgent = true
+                )
+            } else {
+                speakScanGuidance("liveness_challenge", VoicePromptScript.livenessChallengePrompt())
             }
             return
         }
@@ -585,7 +686,7 @@ class AttendanceViewModel(
             _terminalPhase.update { phase ->
                 if (phase is TerminalUiPhase.Scanning) {
                     val hint = if (employees.none { FaceBiometricMatcher.parseSignature(it.faceSignature) != null }) {
-                        "No registered faces in local storage • Tap Register"
+                        "No registered faces in local storage"
                     } else {
                         "Unrecognized face (${evaluation.bestConfidencePercent}% • need ${FaceBiometricMatcher.MATCH_THRESHOLD_PERCENT}%+)"
                     }
@@ -593,6 +694,9 @@ class AttendanceViewModel(
                 } else {
                     phase
                 }
+            }
+            if (rejectedFaceFrames >= 3) {
+                speakScanGuidance("unrecognized_face", VoicePromptScript.unrecognizedFacePrompt())
             }
             return
         }
@@ -612,7 +716,7 @@ class AttendanceViewModel(
             consecutiveMatchCount = 1
         }
 
-        // Smooth verification lock: accept any registered employee match >= 50% confidence
+        // Smooth verification lock: accept any registered employee match >= 50% confidence with live proof
         if (consecutiveMatchCount >= REQUIRED_CONFIRMING_FRAMES &&
             match.confidencePercent >= FaceBiometricMatcher.MATCH_THRESHOLD_PERCENT
         ) {
@@ -644,14 +748,25 @@ class AttendanceViewModel(
         explicitEventType: AttendanceEventType?,
         liveSelfiePath: String? = null
     ) {
-        val now = calendarProvider()
+        val networkSnapshot = runCatching { activeTimeProvider.syncNow() }
+            .getOrElse { activeTimeProvider.currentSnapshot() }
+        _networkTimeStatus.value = networkSnapshot
+
+        val now = activeTimeProvider.currentCalendar()
         val eventType = explicitEventType ?: AttendanceTimeRules.currentEventType(now)
         val timeLabel = AttendanceTimeRules.formatTimeLabel(now)
         val dateKey = AttendanceTimeRules.formatDateKey(now)
+        val locationSnapshot = runCatching { locationProvider.captureCurrentLocation() }
+            .getOrNull()
+
+        val gpsCoords = locationSnapshot?.coordinatesLabel.orEmpty()
+        val readableAddr = locationSnapshot?.readableAddress.orEmpty()
+        val timeSourceLabel = networkSnapshot.sourceLabel
+
         lastVerifiedEmployeeId = employee.id
         lastVerifiedTimestampMs = System.currentTimeMillis()
 
-        // Persist immediately to local storage so check-in/out never freezes the UI
+        // Persist immediately to local storage with NTP-locked time & verified GPS location
         val localEntry = offlineStore.recordLocalAttendance(
             employee = employee,
             eventType = eventType,
@@ -659,12 +774,16 @@ class AttendanceViewModel(
             confidenceScore = confidence,
             loggedTimeLabel = timeLabel,
             loggedDateKey = dateKey,
-            synced = false
+            synced = false,
+            gpsCoordinates = gpsCoords,
+            locationAddress = readableAddr,
+            timeSource = timeSourceLabel
         )
         val durableSelfiePath = offlineStore.persistSelfieForLog(localEntry.id, liveSelfiePath)
             ?: liveSelfiePath
 
         val senderAccount = emailReporter?.resolveSenderAccountEmail()
+        emailReminderJob?.cancel()
 
         _terminalPhase.value = TerminalUiPhase.Verified(
             employee = employee,
@@ -675,8 +794,19 @@ class AttendanceViewModel(
             syncedToCloud = false,
             logId = localEntry.id,
             liveSelfiePath = durableSelfiePath,
+            gpsCoordinates = gpsCoords,
+            locationAddress = readableAddr,
+            timeSourceLabel = timeSourceLabel,
             deviceSenderAccount = senderAccount,
-            emailReportStatus = EmailReportStatus.NEEDS_CONFIG
+            emailReportStatus = EmailReportStatus.NEEDS_CONFIG,
+            emailEnforcementWarningActive = false,
+            emailEnforcementMessage = null,
+            checkOutEmailTriggeredOrSent = eventType != AttendanceEventType.CHECK_OUT
+        )
+
+        voiceSpeaker.speak(
+            VoicePromptScript.verificationPrompt(employee.name, eventType),
+            flush = true
         )
 
         // Sync to Firebase Firestore in background without blocking the verified confirmation
@@ -692,7 +822,10 @@ class AttendanceViewModel(
                         confidenceScore = confidence,
                         loggedTimeLabel = timeLabel,
                         loggedDateKey = dateKey,
-                        explicitLogId = localEntry.id
+                        explicitLogId = localEntry.id,
+                        gpsCoordinates = gpsCoords,
+                        locationAddress = readableAddr,
+                        timeSource = timeSourceLabel
                     )
                 }.onSuccess { cloudResult ->
                     if (cloudResult.isSuccess) {
@@ -713,12 +846,14 @@ class AttendanceViewModel(
             }
         }
 
-        // Conditional Email Notification:
+        // Conditional Email Notification & Strict Check-Out Enforcement:
         // - CHECK-IN: Never dispatch email. Auto-return to live scanning after 2.5s.
-        // - CHECK-OUT: Automatically trigger SMTP/TLS email dispatch when Check-Out is recorded.
+        // - CHECK-OUT: Immediately generate PDF + trigger SMTP email dispatch if configured,
+        //              and enforce continuous AI prompt + blocking warning until email is sent/triggered.
         if (eventType == AttendanceEventType.CHECK_IN) {
             scheduleAutoResetToReady()
         } else {
+            offlineStore.markEmailPending(localEntry.id)
             val reporter = emailReporter
             if (reporter != null && reporter.hasConfiguredSmtpCredentials()) {
                 _terminalPhase.update { phase ->
@@ -738,6 +873,75 @@ class AttendanceViewModel(
                     liveSelfiePath = durableSelfiePath,
                     rescheduleResetAfter = false
                 )
+            } else {
+                // Pre-generate the structured weekly PDF report immediately so Send Email is instant
+                if (reporter != null) {
+                    val recentLogsSnapshot = offlineStore.logs.value
+                    viewModelScope.launch {
+                        runCatching {
+                            reporter.generateReportPdfFile(
+                                employee = employee,
+                                log = localEntry,
+                                eventType = eventType,
+                                verificationMethod = method,
+                                confidenceScore = confidence,
+                                syncedToCloud = false,
+                                recentDailyLogs = recentLogsSnapshot,
+                                liveSelfiePath = durableSelfiePath
+                            )
+                        }
+                    }
+                }
+                startCheckOutEmailEnforcementLoop(localEntry.id)
+            }
+        }
+    }
+
+    /**
+     * Blocks any attempt to skip, close, or dismiss Check-Out before the mandatory email action
+     * has been triggered/sent, activating both the persistent warning banner and AI voice prompt.
+     */
+    fun attemptSkipOrDismissCheckOut() {
+        val current = _terminalPhase.value as? TerminalUiPhase.Verified ?: return
+        if (current.isCheckOutEmailCompleted) {
+            resetToReady()
+            return
+        }
+        _terminalPhase.update { phase ->
+            if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                phase.copy(
+                    emailEnforcementWarningActive = true,
+                    emailEnforcementMessage = VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
+                )
+            } else {
+                phase
+            }
+        }
+        voiceSpeaker.speak(VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT, flush = true)
+    }
+
+    private fun startCheckOutEmailEnforcementLoop(logId: String) {
+        emailReminderJob?.cancel()
+        emailReminderJob = viewModelScope.launch {
+            while (isActive) {
+                delay(EMAIL_ENFORCEMENT_INTERVAL_MS)
+                val current = _terminalPhase.value as? TerminalUiPhase.Verified ?: break
+                if (current.logId != logId || current.isCheckOutEmailCompleted) {
+                    break
+                }
+                if (current.emailReportStatus != EmailReportStatus.DISPATCHING) {
+                    _terminalPhase.update { phase ->
+                        if (phase is TerminalUiPhase.Verified && phase.logId == logId) {
+                            phase.copy(
+                                emailEnforcementWarningActive = true,
+                                emailEnforcementMessage = VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
+                            )
+                        } else {
+                            phase
+                        }
+                    }
+                    voiceSpeaker.speak(VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT, flush = true)
+                }
             }
         }
     }
@@ -755,9 +959,17 @@ class AttendanceViewModel(
         if (current.emailReportStatus == EmailReportStatus.DISPATCHING) return
 
         resetTimerJob?.cancel()
+        emailReminderJob?.cancel()
 
         val reporter = emailReporter
         if (reporter == null) {
+            _terminalPhase.update { phase ->
+                if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                    phase.copy(checkOutEmailTriggeredOrSent = true)
+                } else {
+                    phase
+                }
+            }
             resetToReady()
             return
         }
@@ -765,14 +977,24 @@ class AttendanceViewModel(
         val matchingLog = buildLogForVerifiedPhase(current)
         val snapshotLogs = offlineStore.logs.value
 
-        if (current.emailReportStatus == EmailReportStatus.SENT) {
+        if (current.emailReportStatus == EmailReportStatus.SENT || current.checkOutEmailTriggeredOrSent) {
+            _terminalPhase.update { phase ->
+                if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                    phase.copy(checkOutEmailTriggeredOrSent = true, emailEnforcementWarningActive = false)
+                } else {
+                    phase
+                }
+            }
             resetToReady()
             return
         }
 
         _terminalPhase.update { phase ->
             if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
-                phase.copy(emailReportStatus = EmailReportStatus.DISPATCHING)
+                phase.copy(
+                    emailReportStatus = EmailReportStatus.DISPATCHING,
+                    emailEnforcementWarningActive = false
+                )
             } else {
                 phase
             }
@@ -780,6 +1002,7 @@ class AttendanceViewModel(
 
         viewModelScope.launch {
             var dispatchedViaSmtp = false
+            var openedDeviceShare = false
             if (reporter.hasConfiguredSmtpCredentials()) {
                 val outcome = reporter.generateAndSendReport(
                     employee = current.employee,
@@ -821,11 +1044,44 @@ class AttendanceViewModel(
                     )
                     offlineStore.markEmailSent(matchingLog.id)
                     onLaunchEmailIntent(gmailIntent)
+                    openedDeviceShare = true
                 }.onFailure { err ->
                     Log.w(TAG, "Failed to launch Gmail share intent: ${err.message}")
                 }
             }
-            resetToReady()
+
+            if (dispatchedViaSmtp || openedDeviceShare) {
+                _terminalPhase.update { phase ->
+                    if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                        phase.copy(
+                            checkOutEmailTriggeredOrSent = true,
+                            emailEnforcementWarningActive = false,
+                            emailReportStatus = if (dispatchedViaSmtp) EmailReportStatus.SENT else EmailReportStatus.QUEUED_OFFLINE
+                        )
+                    } else {
+                        phase
+                    }
+                }
+                voiceSpeaker.speak(
+                    VoicePromptScript.emailDispatchedPrompt(openedDeviceApp = openedDeviceShare),
+                    flush = true
+                )
+                resetToReady()
+            } else {
+                _terminalPhase.update { phase ->
+                    if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                        phase.copy(
+                            emailReportStatus = EmailReportStatus.QUEUED_OFFLINE,
+                            emailEnforcementWarningActive = true,
+                            emailEnforcementMessage = VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT
+                        )
+                    } else {
+                        phase
+                    }
+                }
+                voiceSpeaker.speak(VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT, flush = true)
+                startCheckOutEmailEnforcementLoop(current.logId)
+            }
         }
     }
 
@@ -886,7 +1142,10 @@ class AttendanceViewModel(
                 verificationMethod = current.verificationMethod.wireValue,
                 confidenceScore = current.confidenceScore.toLong().coerceIn(0L, 100L),
                 loggedTimeLabel = current.timestampLabel,
-                loggedDateKey = AttendanceTimeRules.formatDateKey()
+                loggedDateKey = AttendanceTimeRules.formatDateKey(activeTimeProvider.currentCalendar()),
+                gpsCoordinates = current.gpsCoordinates,
+                locationAddress = current.locationAddress,
+                timeSource = current.timeSourceLabel
             )
     }
 
@@ -918,19 +1177,61 @@ class AttendanceViewModel(
                 offlineStore.markEmailPending(log.id)
             } else if (outcome == EmailReportStatus.SENT) {
                 offlineStore.markEmailSent(log.id)
+                emailReminderJob?.cancel()
                 retryPendingEmailReports()
+                voiceSpeaker.speak(
+                    VoicePromptScript.emailDispatchedPrompt(openedDeviceApp = false),
+                    flush = false
+                )
             }
             _terminalPhase.update { current ->
                 if (current is TerminalUiPhase.Verified && current.logId == log.id) {
-                    current.copy(emailReportStatus = outcome)
+                    current.copy(
+                        emailReportStatus = outcome,
+                        checkOutEmailTriggeredOrSent = outcome == EmailReportStatus.SENT || current.checkOutEmailTriggeredOrSent,
+                        emailEnforcementWarningActive = if (outcome == EmailReportStatus.SENT) false else current.emailEnforcementWarningActive
+                    )
                 } else {
                     current
                 }
             }
-            if (rescheduleResetAfter) {
+            if (outcome != EmailReportStatus.SENT && eventType == AttendanceEventType.CHECK_OUT) {
+                startCheckOutEmailEnforcementLoop(log.id)
+            }
+            if (rescheduleResetAfter && outcome == EmailReportStatus.SENT) {
                 scheduleAutoResetToReady()
             }
         }
+    }
+
+    private fun speakWelcomeIfNeeded(force: Boolean) {
+        val now = System.currentTimeMillis()
+        if (!force && (now - welcomeSpokenAtMs) < WELCOME_THROTTLE_MS) return
+        welcomeSpokenAtMs = now
+        lastVoicePromptKey = "welcome"
+        lastVoicePromptAtMs = now
+        voiceSpeaker.speak(VoicePromptScript.welcomeScannerPrompt(), flush = true)
+    }
+
+    private fun speakScanGuidance(
+        key: String,
+        message: String,
+        minIntervalMs: Long = SCAN_GUIDANCE_THROTTLE_MS,
+        urgent: Boolean = false
+    ) {
+        val now = System.currentTimeMillis()
+        if (lastVoicePromptKey == key && (now - lastVoicePromptAtMs) < minIntervalMs) return
+        if (!urgent &&
+            lastVoicePromptKey != null &&
+            lastVoicePromptKey != "welcome" &&
+            lastVoicePromptKey != key &&
+            (now - lastVoicePromptAtMs) < GLOBAL_SCAN_VOICE_GAP_MS
+        ) {
+            return
+        }
+        lastVoicePromptKey = key
+        lastVoicePromptAtMs = now
+        voiceSpeaker.speak(message, flush = urgent)
     }
 
     private fun scheduleAutoResetToReady() {
@@ -949,13 +1250,20 @@ class AttendanceViewModel(
     }
 
     fun resetToReady() {
+        val activeVerified = _terminalPhase.value as? TerminalUiPhase.Verified
+        if (activeVerified != null && !activeVerified.isCheckOutEmailCompleted) {
+            attemptSkipOrDismissCheckOut()
+            return
+        }
         scanTimerJob?.cancel()
         resetTimerJob?.cancel()
+        emailReminderJob?.cancel()
         scanMatchInFlight = false
         consecutiveMatchCount = 0
         livenessHoldCount = 0
         lastMatchedEmployeeId = null
         latestCapturedSelfiePath = null
+        antiSpoofingTracker.reset()
         _terminalPhase.value = if (continuousKioskMode) {
             TerminalUiPhase.Scanning(
                 attempt = 1,
@@ -973,12 +1281,18 @@ class AttendanceViewModel(
         super.onCleared()
         scanTimerJob?.cancel()
         resetTimerJob?.cancel()
+        emailReminderJob?.cancel()
+        voiceSpeaker.shutdown()
     }
 
     private companion object {
         const val TAG = "AttendanceVM"
         const val ATTEMPT_DURATION_MS = 7000L
         const val VERIFIED_AUTO_RESET_MS = 2500L
+        const val EMAIL_ENFORCEMENT_INTERVAL_MS = 6000L
+        const val WELCOME_THROTTLE_MS = 30_000L
+        const val SCAN_GUIDANCE_THROTTLE_MS = 5500L
+        const val GLOBAL_SCAN_VOICE_GAP_MS = 3200L
         const val REQUIRED_CONFIRMING_FRAMES = 1
         const val LIVENESS_HOLD_FRAMES = 1
     }

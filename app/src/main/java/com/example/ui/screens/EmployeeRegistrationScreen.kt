@@ -102,7 +102,11 @@ fun EmployeeRegistrationScreen(
     onNavigateToScanner: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    BackHandler { onNavigateToScanner() }
+    val enrolledSaved = remember(savedEmployees) {
+        savedEmployees.filter { FaceBiometricMatcher.parseSignature(it.faceSignature) != null }
+    }
+
+    BackHandler(enabled = enrolledSaved.isNotEmpty()) { onNavigateToScanner() }
 
     val drafts = remember { mutableStateListOf(EmployeeDraftItem()) }
     val listState = rememberLazyListState()
@@ -111,9 +115,6 @@ fun EmployeeRegistrationScreen(
     var formErrorText by remember { mutableStateOf<String?>(null) }
 
     val readyDrafts = drafts.filter { it.isComplete }
-    val enrolledSaved = remember(savedEmployees) {
-        savedEmployees.filter { FaceBiometricMatcher.parseSignature(it.faceSignature) != null }
-    }
 
     Box(
         modifier = modifier
@@ -139,19 +140,21 @@ fun EmployeeRegistrationScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.weight(1f)
                 ) {
-                    IconButton(
-                        onClick = onNavigateToScanner,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("registration_back_to_scanner")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                            contentDescription = stringResource(R.string.open_scanner),
-                            tint = NeonCyan
-                        )
+                    if (enrolledSaved.isNotEmpty()) {
+                        IconButton(
+                            onClick = onNavigateToScanner,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("registration_back_to_scanner")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                                contentDescription = stringResource(R.string.open_scanner),
+                                tint = NeonCyan
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
                     }
-                    Spacer(modifier = Modifier.width(6.dp))
                     Column {
                         Text(
                             text = stringResource(R.string.register_employees),
@@ -162,7 +165,11 @@ fun EmployeeRegistrationScreen(
                             overflow = TextOverflow.Ellipsis
                         )
                         Text(
-                            text = "Local Storage • ${enrolledSaved.size} Face Profile(s) Enrolled",
+                            text = if (enrolledSaved.isEmpty()) {
+                                "First-Time Setup • Add all staff members once"
+                            } else {
+                                "Local Storage • ${enrolledSaved.size} Face Profile(s) Enrolled"
+                            },
                             style = MaterialTheme.typography.labelMedium,
                             color = TextSecondary,
                             maxLines = 1,
@@ -171,15 +178,17 @@ fun EmployeeRegistrationScreen(
                     }
                 }
 
-                TextButton(
-                    onClick = onNavigateToScanner,
-                    modifier = Modifier.minimumInteractiveComponentSize()
-                ) {
-                    Text(
-                        text = stringResource(R.string.open_scanner),
-                        color = NeonCyan,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                if (enrolledSaved.isNotEmpty()) {
+                    TextButton(
+                        onClick = onNavigateToScanner,
+                        modifier = Modifier.minimumInteractiveComponentSize()
+                    ) {
+                        Text(
+                            text = stringResource(R.string.open_scanner),
+                            color = NeonCyan,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                 }
             }
 

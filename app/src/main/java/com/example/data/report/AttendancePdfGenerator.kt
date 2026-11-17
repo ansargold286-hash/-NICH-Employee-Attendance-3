@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -15,7 +16,6 @@ import android.text.StaticLayout
 import android.text.TextDirectionHeuristics
 import android.text.TextPaint
 import android.text.TextUtils
-import com.example.R
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
 import com.example.data.model.BidiTextHelper
@@ -23,13 +23,37 @@ import com.example.data.model.Employee
 import com.example.data.model.VerificationMethod
 import java.io.File
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
 import java.util.Locale
+import kotlin.math.max
+
+data class WeeklyDayRow(
+    val dateKey: String,
+    val dayDateLabel: String,
+    val checkInLabel: String,
+    val checkOutLabel: String,
+    val dutyHoursLabel: String,
+    val isPresent: Boolean,
+    val dutyMinutes: Int
+)
+
+data class WeeklyReportSummary(
+    val weekRangeLabel: String,
+    val rows: List<WeeklyDayRow>,
+    val totalWorkingDays: Int,
+    val totalDutyHoursLabel: String,
+    val overallStatusLabel: String,
+    val generatedOnLabel: String
+)
 
 object AttendancePdfGenerator {
 
-    private const val PAGE_WIDTH = 595
-    private const val PAGE_HEIGHT = 842
-    private const val MARGIN_X = 40f
+    // A4 Landscape to match the Weekly Attendance Report sample layout
+    private const val PAGE_WIDTH = 842
+    private const val PAGE_HEIGHT = 595
+    private const val MARGIN_X = 28f
 
     fun generateReportPdf(
         context: Context,
@@ -50,65 +74,157 @@ object AttendancePdfGenerator {
         val safeLogId = log.id.replace(Regex("[^a-zA-Z0-9_-]"), "_")
         val outFile = File(reportsDir, "NICH_${safeCode}_${eventType.wireValue}_${safeLogId}.pdf")
 
-        val summaryRows = listOf(
-            "Report ID" to log.id,
-            "Employee Name" to BidiTextHelper.formatEmployeeHeaderTitle(employee.name, employee.employeeCode),
-            "Employee Code" to employee.employeeCode,
-            "Department" to employee.department,
-            "Role Title" to employee.roleTitle,
-            "Attendance Type" to "${eventType.displayLabel} (${eventType.wireValue})",
-            "Verification Method" to verificationMethod.displayLabel,
-            "Match Confidence" to "${confidenceScore.coerceIn(0, 100)}%",
-            "Timestamp" to "${log.loggedTimeLabel}  •  ${log.loggedDateKey}",
-            "Cloud Sync Status" to if (syncedToCloud) {
-                "Synced to Cloud Firestore (attendanceapp-f6a0e)"
-            } else {
-                "Recorded Offline (Queued for Cloud Sync)"
-            },
-            "Report Recipient" to recipientEmail
+        val weeklySummary = buildWeeklySummary(
+            employee = employee,
+            currentLog = log,
+            recentDailyLogs = recentDailyLogs
         )
-        val todaysLogs = recentDailyLogs.filter { it.loggedDateKey == log.loggedDateKey }
 
-        val nativePdfSuccess = tryWriteNativePdf(
-            context = context,
+        val registeredPhotoPath = employee.localPhotoPath
+            .takeIf { it.isNotBlank() && File(it).let { f -> f.exists() && f.length() > 0L } }
+        val liveCapturePath = liveSelfiePath
+            ?.takeIf { it.isNotBlank() && File(it).let { f -> f.exists() && f.length() > 0L } }
+
+        val nativePdfSuccess = tryWriteNativeWeeklyPdf(
             outFile = outFile,
-            employeeName = employee.name,
-            employeeCode = employee.employeeCode,
-            eventType = eventType,
-            logDateKey = log.loggedDateKey,
-            loggedTimeLabel = log.loggedTimeLabel,
-            rows = summaryRows,
-            todaysLogs = todaysLogs,
-            recipientEmail = recipientEmail,
-            liveSelfiePath = liveSelfiePath
+            employee = employee,
+            currentLog = log,
+            weeklySummary = weeklySummary,
+            registeredPhotoPath = registeredPhotoPath ?: liveCapturePath,
+            liveCapturePath = liveCapturePath ?: registeredPhotoPath,
+            hasDistinctLiveCapture = liveCapturePath != null
         )
+
         if (!nativePdfSuccess || !outFile.exists() || outFile.length() == 0L) {
             writeFallbackPdf14(
                 outFile = outFile,
-                eventType = eventType,
-                logDateKey = log.loggedDateKey,
-                rows = summaryRows,
-                todaysLogs = todaysLogs,
+                employee = employee,
+                currentLog = log,
+                weeklySummary = weeklySummary,
                 recipientEmail = recipientEmail,
-                liveSelfiePath = liveSelfiePath
+                portraitPath = liveCapturePath ?: registeredPhotoPath
             )
         }
 
         return outFile
     }
 
-    private fun tryWriteNativePdf(
-        context: Context,
+    internal fun buildWeeklySummary(
+        employee: Employee,
+        currentLog: AttendanceLog,
+        recentDailyLogs: List<AttendanceLog>,
+        generatedAt: Date = Date()
+    ): WeeklyReportSummary {
+        val anchorCal = parseDateKeyCalendar(currentLog.loggedDateKey) ?: Calendar.getInstance()
+
+        // Snap anchor calendar to Monday of its ISO/standard Monday–Sunday week
+        val mondayCal = (anchorCal.clone() as Calendar).apply {
+            val dow = get(Calendar.DAY_OF_WEEK)
+            val daysFromMonday = when (dow) {
+                Calendar.MONDAY -> 0
+                Calendar.TUESDAY -> 1
+                Calendar.WEDNESDAY -> 2
+                Calendar.THURSDAY -> 3
+                Calendar.FRIDAY -> 4
+                Calendar.SATURDAY -> 5
+                Calendar.SUNDAY -> 6
+                else -> 0
+            }
+            add(Calendar.DAY_OF_MONTH, -daysFromMonday)
+        }
+        val sundayCal = (mondayCal.clone() as Calendar).apply {
+            add(Calendar.DAY_OF_MONTH, 6)
+        }
+
+        val dateKeyFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val weekHeaderDateFormat = SimpleDateFormat("dd MMM yyyy", Locale.US)
+        val rowDayDateFormat = SimpleDateFormat("EEEE, dd MMM yyyy", Locale.US)
+        val generatedFormat = SimpleDateFormat("dd MMM yyyy  hh:mm a", Locale.US)
+
+        val weekRangeLabel =
+            "For the Week: ${weekHeaderDateFormat.format(mondayCal.time)} \u2013 ${weekHeaderDateFormat.format(sundayCal.time)}"
+
+        // Merge recentDailyLogs with currentLog (deduplicated by id) for this employee
+        val combinedEmployeeLogs = (listOf(currentLog) + recentDailyLogs)
+            .distinctBy { it.id.ifBlank { "${it.loggedDateKey}_${it.eventType}_${it.loggedTimeLabel}" } }
+            .filter { item ->
+                (employee.id.isNotBlank() && item.employeeId == employee.id) ||
+                    (employee.employeeCode.isNotBlank() && item.employeeCode == employee.employeeCode)
+            }
+
+        val logsByDate = combinedEmployeeLogs.groupBy { it.loggedDateKey }
+        val rows = mutableListOf<WeeklyDayRow>()
+        var totalWorkingDays = 0
+        var totalDutyMinutes = 0
+
+        val cursor = mondayCal.clone() as Calendar
+        for (i in 0 until 7) {
+            val dayKey = dateKeyFormat.format(cursor.time)
+            val dayDateLabel = rowDayDateFormat.format(cursor.time)
+            val dayLogs = logsByDate[dayKey].orEmpty()
+
+            val checkInLogs = dayLogs.filter { it.eventType == AttendanceEventType.CHECK_IN.wireValue }
+            val checkOutLogs = dayLogs.filter { it.eventType == AttendanceEventType.CHECK_OUT.wireValue }
+
+            val firstCheckIn = checkInLogs
+                .minByOrNull { parseTimeLabelMinutes(it.loggedTimeLabel) ?: Int.MAX_VALUE }
+            val lastCheckOut = checkOutLogs
+                .maxByOrNull { parseTimeLabelMinutes(it.loggedTimeLabel) ?: Int.MIN_VALUE }
+
+            val checkInText = firstCheckIn?.loggedTimeLabel?.takeIf { it.isNotBlank() } ?: "--"
+            val checkOutText = lastCheckOut?.loggedTimeLabel?.takeIf { it.isNotBlank() } ?: "--"
+
+            val inMinutes = firstCheckIn?.let { parseTimeLabelMinutes(it.loggedTimeLabel) }
+            val outMinutes = lastCheckOut?.let { parseTimeLabelMinutes(it.loggedTimeLabel) }
+
+            val dutyMinutes = if (inMinutes != null && outMinutes != null && outMinutes >= inMinutes) {
+                outMinutes - inMinutes
+            } else {
+                0
+            }
+            val dutyHoursText = when {
+                inMinutes != null && outMinutes != null && outMinutes >= inMinutes ->
+                    formatDurationHoursMinutes(dutyMinutes)
+                dayLogs.isNotEmpty() -> "00:00 Hrs"
+                else -> "--"
+            }
+
+            val present = dayLogs.isNotEmpty()
+            if (present) {
+                totalWorkingDays++
+                totalDutyMinutes += dutyMinutes
+            }
+
+            rows += WeeklyDayRow(
+                dateKey = dayKey,
+                dayDateLabel = dayDateLabel,
+                checkInLabel = formatShortTimeLabel(checkInText),
+                checkOutLabel = formatShortTimeLabel(checkOutText),
+                dutyHoursLabel = dutyHoursText,
+                isPresent = present,
+                dutyMinutes = dutyMinutes
+            )
+            cursor.add(Calendar.DAY_OF_MONTH, 1)
+        }
+
+        return WeeklyReportSummary(
+            weekRangeLabel = weekRangeLabel,
+            rows = rows,
+            totalWorkingDays = max(totalWorkingDays, 1),
+            totalDutyHoursLabel = formatDurationHoursMinutes(totalDutyMinutes),
+            overallStatusLabel = "Present",
+            generatedOnLabel = generatedFormat.format(generatedAt)
+        )
+    }
+
+    private fun tryWriteNativeWeeklyPdf(
         outFile: File,
-        employeeName: String,
-        employeeCode: String,
-        eventType: AttendanceEventType,
-        logDateKey: String,
-        loggedTimeLabel: String,
-        rows: List<Pair<String, String>>,
-        todaysLogs: List<AttendanceLog>,
-        recipientEmail: String,
-        liveSelfiePath: String?
+        employee: Employee,
+        currentLog: AttendanceLog,
+        weeklySummary: WeeklyReportSummary,
+        registeredPhotoPath: String?,
+        liveCapturePath: String?,
+        hasDistinctLiveCapture: Boolean
     ): Boolean {
         return try {
             val document = PdfDocument()
@@ -117,249 +233,444 @@ object AttendancePdfGenerator {
                 val page = document.startPage(pageInfo)
                 val canvas = page.canvas
 
-                val headerBgPaint = Paint().apply {
-                    color = Color.rgb(11, 20, 38)
-                    style = Paint.Style.FILL
-                }
-                val accentColor = if (eventType == AttendanceEventType.CHECK_IN) {
-                    Color.rgb(0, 184, 113)
-                } else {
-                    Color.rgb(0, 145, 234)
-                }
-                val accentPaint = Paint().apply {
-                    color = accentColor
-                    style = Paint.Style.FILL
-                }
-                val borderPaint = Paint().apply {
-                    color = Color.rgb(210, 220, 235)
+                // Pure white sheet background
+                canvas.drawColor(Color.WHITE)
+
+                val darkInk = Color.rgb(17, 17, 17)
+                val mutedInk = Color.rgb(65, 65, 65)
+                val tableHeaderFill = Color.rgb(229, 232, 236)
+                val gridStrokeColor = Color.rgb(45, 45, 45)
+                val greenBadgeColor = Color.rgb(22, 163, 74)
+
+                val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
                     style = Paint.Style.STROKE
-                    strokeWidth = 1.2f
+                    strokeWidth = 1.6f
                 }
-                val rowAltPaint = Paint().apply {
-                    color = Color.rgb(245, 248, 252)
+                val thinDividerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.rgb(55, 55, 55)
+                    style = Paint.Style.STROKE
+                    strokeWidth = 1.1f
+                }
+                val tableBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = gridStrokeColor
+                    style = Paint.Style.STROKE
+                    strokeWidth = 1.0f
+                }
+                val headerFillPaint = Paint().apply {
+                    color = tableHeaderFill
                     style = Paint.Style.FILL
                 }
 
-                val titlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.WHITE
-                    textSize = 18f
+                val orgTitlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 13.5f
                     typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 }
-                val subtitlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.rgb(138, 164, 200)
+                val orgSubPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = mutedInk
                     textSize = 10.5f
                 }
-                val sectionPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.rgb(15, 28, 52)
-                    textSize = 13f
+                val mainTitlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 18.5f
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    textAlign = Paint.Align.CENTER
+                }
+                val weekSubPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = mutedInk
+                    textSize = 11f
+                    textAlign = Paint.Align.CENTER
+                }
+                val rightSystemPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 10f
                     typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 }
-                val labelPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.rgb(86, 110, 144)
+                val metaLabelPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 11.5f
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                }
+                val metaValuePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 11.5f
+                }
+                val tableHeaderTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 11.5f
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    textAlign = Paint.Align.CENTER
+                }
+                val cellTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 11f
+                    textAlign = Paint.Align.CENTER
+                }
+                val cellLeftTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 11f
+                    textAlign = Paint.Align.LEFT
+                }
+                val statusPillTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE
+                    textSize = 10.5f
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    textAlign = Paint.Align.CENTER
+                }
+                val footerBoldPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
                     textSize = 10.5f
                     typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
                 }
-                val valuePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.rgb(18, 28, 45)
-                    textSize = 11f
-                }
-                val badgeTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.WHITE
-                    textSize = 11f
-                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                val footerRegularPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 10.5f
                 }
 
-                // Header Banner with Official App Logo
-                canvas.drawRect(0f, 0f, PAGE_WIDTH.toFloat(), 96f, headerBgPaint)
-                canvas.drawRect(0f, 92f, PAGE_WIDTH.toFloat(), 96f, accentPaint)
+                // =========================================================
+                // 1. TOP HEADER BAR (Left Org | Center Title | Right Clock)
+                // =========================================================
+                canvas.drawText("NICH Employee Attendance 3", MARGIN_X, 42f, orgTitlePaint)
+                canvas.drawText("Karachi, Pakistan", MARGIN_X, 58f, orgSubPaint)
 
-                val logoBitmap: Bitmap? = runCatching {
-                    BitmapFactory.decodeResource(context.resources, R.drawable.nich_official_logo)
-                }.getOrNull()
-                val textStartX = if (logoBitmap != null) {
-                    val destRect = RectF(MARGIN_X, 20f, MARGIN_X + 52f, 72f)
-                    canvas.drawBitmap(
-                        logoBitmap,
-                        Rect(0, 0, logoBitmap.width, logoBitmap.height),
-                        destRect,
-                        Paint(Paint.FILTER_BITMAP_FLAG)
-                    )
-                    logoBitmap.recycle()
-                    MARGIN_X + 64f
-                } else {
-                    MARGIN_X
+                canvas.drawLine(252f, 24f, 252f, 66f, thinDividerPaint)
+
+                val centerHeaderX = 436f
+                canvas.drawText("WEEKLY ATTENDANCE REPORT", centerHeaderX, 44f, mainTitlePaint)
+                canvas.drawText(weeklySummary.weekRangeLabel, centerHeaderX, 62f, weekSubPaint)
+
+                canvas.drawLine(622f, 24f, 622f, 66f, thinDividerPaint)
+
+                // Vector Clock Icon matching sample
+                val clockCx = 656f
+                val clockCy = 46f
+                val clockRadius = 18f
+                val clockPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    style = Paint.Style.STROKE
+                    strokeWidth = 2.6f
+                    strokeCap = Paint.Cap.ROUND
                 }
+                canvas.drawCircle(clockCx, clockCy, clockRadius, clockPaint)
+                canvas.drawLine(clockCx, clockCy, clockCx, clockCy - 10f, clockPaint)
+                canvas.drawLine(clockCx, clockCy, clockCx + 8f, clockCy + 5f, clockPaint)
 
-                canvas.drawText("NICH EMPLOYEE ATTENDANCE 3", textStartX, 42f, titlePaint)
-                canvas.drawText(
-                    "AUTOMATED BIOMETRIC & PASSCODE ATTENDANCE REPORT",
-                    textStartX,
-                    64f,
-                    subtitlePaint
+                canvas.drawText("ATTENDANCE", 686f, 36f, rightSystemPaint)
+                canvas.drawText("MANAGEMENT", 686f, 49f, rightSystemPaint)
+                canvas.drawText("SYSTEM", 686f, 62f, rightSystemPaint)
+
+                // Thick header bottom rule
+                canvas.drawLine(MARGIN_X, 76f, PAGE_WIDTH - MARGIN_X, 76f, linePaint)
+
+                // =========================================================
+                // 2. REGISTERED PHOTO + EMPLOYEE INFO + MIDDLE LIVE CAPTURE + KPI SUMMARY
+                // =========================================================
+                val photoBoxTop = 88f
+                val photoBoxSize = 108f
+                val leftPhotoRect = RectF(
+                    MARGIN_X,
+                    photoBoxTop,
+                    MARGIN_X + photoBoxSize,
+                    photoBoxTop + photoBoxSize
+                )
+                drawFramedPortraitBox(
+                    canvas = canvas,
+                    rect = leftPhotoRect,
+                    photoPath = registeredPhotoPath,
+                    fallbackInitials = employee.name.trim().take(2).uppercase(Locale.US).ifEmpty { "ST" },
+                    borderPaint = thinDividerPaint,
+                    caption = "Employee Photo",
+                    darkInk = darkInk,
+                    mutedInk = mutedInk
                 )
 
-                // Event Pill on Header Right
-                val badgeRect = RectF(PAGE_WIDTH - MARGIN_X - 118f, 28f, PAGE_WIDTH - MARGIN_X, 60f)
-                canvas.drawRoundRect(badgeRect, 8f, 8f, accentPaint)
-                canvas.drawText(
-                    eventType.displayLabel,
-                    badgeRect.left + 22f,
-                    badgeRect.top + 20f,
-                    badgeTextPaint
+                // Left-Middle Employee Details Column
+                val cleanDisplayName = BidiTextHelper.stripBidiControls(
+                    BidiTextHelper.formatEmployeeHeaderTitle(employee.name, "")
+                ).ifBlank { employee.name }
+                val cardNo = employee.checkInCode.ifBlank {
+                    employee.passcode
+                }.ifBlank { employee.employeeCode }
+
+                val employeeDetails = listOf(
+                    "Employee Name" to cleanDisplayName,
+                    "Employee ID" to employee.employeeCode.ifBlank { "N/A" },
+                    "Department" to employee.department.ifBlank { "Operations" },
+                    "Designation" to employee.roleTitle.ifBlank { "Staff" },
+                    "Card No" to cardNo
                 )
 
-                var y = 130f
-                canvas.drawText("ATTENDANCE EVENT SUMMARY", MARGIN_X, y, sectionPaint)
-                y += 14f
-
-                val tableTop = y
-                val rowHeight = 28f
-                val tableWidth = PAGE_WIDTH - (MARGIN_X * 2f)
-                val colSplit = MARGIN_X + 165f
-                val valueWidth = (MARGIN_X + tableWidth) - colSplit - 8f
-
-                rows.forEachIndexed { index, (label, value) ->
-                    val rowTop = tableTop + (index * rowHeight)
-                    if (index % 2 == 0) {
-                        canvas.drawRect(
-                            MARGIN_X,
-                            rowTop,
-                            MARGIN_X + tableWidth,
-                            rowTop + rowHeight,
-                            rowAltPaint
-                        )
-                    }
-                    drawBidiBoundedText(
-                        canvas = canvas,
-                        text = label,
-                        x = MARGIN_X + 10f,
-                        yTop = rowTop,
-                        maxWidth = (colSplit - MARGIN_X - 24f),
-                        maxHeight = rowHeight,
-                        paint = labelPaint
-                    )
+                val detailLabelX = 148f
+                val detailColonX = 248f
+                val detailValueX = 258f
+                val detailMaxValueW = 162f
+                var detailY = 90f
+                employeeDetails.forEach { (label, value) ->
+                    canvas.drawText(label, detailLabelX, detailY + 13f, metaLabelPaint)
+                    canvas.drawText(":", detailColonX, detailY + 13f, metaLabelPaint)
                     drawBidiBoundedText(
                         canvas = canvas,
                         text = value,
-                        x = colSplit,
-                        yTop = rowTop,
-                        maxWidth = valueWidth,
-                        maxHeight = rowHeight,
-                        paint = valuePaint
+                        x = detailValueX,
+                        yTop = detailY,
+                        maxWidth = detailMaxValueW,
+                        maxHeight = 20f,
+                        paint = metaValuePaint
                     )
+                    detailY += 23f
                 }
 
-                val tableBottom = tableTop + (rows.size * rowHeight)
-                canvas.drawRect(MARGIN_X, tableTop, MARGIN_X + tableWidth, tableBottom, borderPaint)
-                canvas.drawLine(colSplit - 12f, tableTop, colSplit - 12f, tableBottom, borderPaint)
+                // Divider 1 before Middle Live Capture Image
+                canvas.drawLine(426f, 90f, 426f, 208f, thinDividerPaint)
 
-                // Daily Activity Breakdown
-                y = tableBottom + 28f
-                val checkInsToday = todaysLogs.count { it.eventType == AttendanceEventType.CHECK_IN.wireValue }
-                val checkOutsToday = todaysLogs.count { it.eventType == AttendanceEventType.CHECK_OUT.wireValue }
-
-                canvas.drawText("DAILY TERMINAL ACTIVITY ($logDateKey)", MARGIN_X, y, sectionPaint)
-                y += 18f
-                canvas.drawText(
-                    "Total Logged Today: ${todaysLogs.size}   |   Check-Ins: $checkInsToday   |   Check-Outs: $checkOutsToday",
-                    MARGIN_X,
-                    y,
-                    valuePaint
+                // MIDDLE: Live Captured Attendance Image (taken right when attendance is marked)
+                val liveBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (hasDistinctLiveCapture) greenBadgeColor else Color.rgb(55, 55, 55)
+                    style = Paint.Style.STROKE
+                    strokeWidth = if (hasDistinctLiveCapture) 1.6f else 1.1f
+                }
+                val middleLiveRect = RectF(
+                    438f,
+                    photoBoxTop,
+                    438f + photoBoxSize,
+                    photoBoxTop + photoBoxSize
                 )
-                y += 16f
+                drawFramedPortraitBox(
+                    canvas = canvas,
+                    rect = middleLiveRect,
+                    photoPath = liveCapturePath,
+                    fallbackInitials = "LIVE",
+                    borderPaint = liveBorderPaint,
+                    caption = "Live Capture",
+                    darkInk = darkInk,
+                    mutedInk = if (hasDistinctLiveCapture) greenBadgeColor else mutedInk
+                )
 
-                todaysLogs.take(3).forEachIndexed { idx, item ->
-                    val lineY = y + (idx * 20f)
-                    val formattedTitle = BidiTextHelper.formatEmployeeHeaderTitle(item.employeeName, item.employeeCode)
-                    drawBidiBoundedText(
-                        canvas = canvas,
-                        text = "${idx + 1}. $formattedTitle — ${item.eventType} at ${item.loggedTimeLabel}",
-                        x = MARGIN_X + 6f,
-                        yTop = lineY,
-                        maxWidth = tableWidth - 12f,
-                        maxHeight = 20f,
-                        paint = valuePaint
-                    )
+                // Divider 2 after Middle Live Capture Image
+                canvas.drawLine(558f, 90f, 558f, 208f, thinDividerPaint)
+
+                // Right Summary KPI Column
+                val kpiLabelX = 570f
+                val kpiColonX = 702f
+                val kpiValueX = 714f
+
+                canvas.drawText("Total Working Days", kpiLabelX, 114f, metaLabelPaint)
+                canvas.drawText(":", kpiColonX, 114f, metaLabelPaint)
+                canvas.drawText(weeklySummary.totalWorkingDays.toString(), kpiValueX, 114f, metaValuePaint)
+
+                canvas.drawText("Total Duty Hours", kpiLabelX, 146f, metaLabelPaint)
+                canvas.drawText(":", kpiColonX, 146f, metaLabelPaint)
+                canvas.drawText(weeklySummary.totalDutyHoursLabel, kpiValueX, 146f, metaValuePaint)
+
+                canvas.drawText("Attendance Status", kpiLabelX, 179f, metaLabelPaint)
+                canvas.drawText(":", kpiColonX, 179f, metaLabelPaint)
+
+                val badgeRect = RectF(kpiValueX, 162f, kpiValueX + 82f, 185f)
+                val greenPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = greenBadgeColor
+                    style = Paint.Style.FILL
                 }
-
-                // Embedded Live Verification Selfie Card
-                val selfieBitmap: Bitmap? = decodeSampledBitmap(liveSelfiePath, 256)
-                if (selfieBitmap != null) {
-                    val cardTop = 602f
-                    val cardBottom = 758f
-                    val cardRect = RectF(MARGIN_X, cardTop, PAGE_WIDTH - MARGIN_X, cardBottom)
-                    canvas.drawRoundRect(cardRect, 10f, 10f, rowAltPaint)
-                    canvas.drawRoundRect(cardRect, 10f, 10f, borderPaint)
-
-                    val thumbSize = 128f
-                    val thumbLeft = MARGIN_X + 14f
-                    val thumbTop = cardTop + 14f
-                    val thumbRect = RectF(thumbLeft, thumbTop, thumbLeft + thumbSize, thumbTop + thumbSize)
-                    canvas.drawBitmap(
-                        selfieBitmap,
-                        Rect(0, 0, selfieBitmap.width, selfieBitmap.height),
-                        thumbRect,
-                        Paint(Paint.FILTER_BITMAP_FLAG)
-                    )
-                    canvas.drawRect(thumbRect, borderPaint)
-                    selfieBitmap.recycle()
-
-                    val infoX = thumbRect.right + 18f
-                    val infoWidth = (PAGE_WIDTH - MARGIN_X - 12f) - infoX
-                    drawBidiBoundedText(
-                        canvas = canvas,
-                        text = "LIVE VERIFICATION SELFIE",
-                        x = infoX,
-                        yTop = cardTop + 20f,
-                        maxWidth = infoWidth,
-                        maxHeight = 22f,
-                        paint = sectionPaint
-                    )
-                    drawBidiBoundedText(
-                        canvas = canvas,
-                        text = "Staff: ${BidiTextHelper.formatEmployeeHeaderTitle(employeeName, employeeCode)}",
-                        x = infoX,
-                        yTop = cardTop + 44f,
-                        maxWidth = infoWidth,
-                        maxHeight = 20f,
-                        paint = valuePaint
-                    )
-                    drawBidiBoundedText(
-                        canvas = canvas,
-                        text = "Status: ${eventType.displayLabel} VERIFIED (Liveness Passed)",
-                        x = infoX,
-                        yTop = cardTop + 66f,
-                        maxWidth = infoWidth,
-                        maxHeight = 20f,
-                        paint = valuePaint
-                    )
-                    drawBidiBoundedText(
-                        canvas = canvas,
-                        text = "Timestamp: $loggedTimeLabel ($logDateKey)",
-                        x = infoX,
-                        yTop = cardTop + 88f,
-                        maxWidth = infoWidth,
-                        maxHeight = 20f,
-                        paint = valuePaint
-                    )
-                    drawBidiBoundedText(
-                        canvas = canvas,
-                        text = "Security: Flexible 1% Biometric Selfie Capture",
-                        x = infoX,
-                        yTop = cardTop + 112f,
-                        maxWidth = infoWidth,
-                        maxHeight = 20f,
-                        paint = labelPaint
-                    )
-                }
-
-                // Footer
-                canvas.drawLine(MARGIN_X, PAGE_HEIGHT - 56f, PAGE_WIDTH - MARGIN_X, PAGE_HEIGHT - 56f, borderPaint)
+                canvas.drawRoundRect(badgeRect, 11f, 11f, greenPaint)
                 canvas.drawText(
-                    "Generated automatically by NICH Employee Attendance 3 Terminal • Dispatched to $recipientEmail",
-                    MARGIN_X,
-                    PAGE_HEIGHT - 34f,
-                    subtitlePaint.apply { color = Color.rgb(95, 115, 145) }
+                    weeklySummary.overallStatusLabel,
+                    badgeRect.centerX(),
+                    badgeRect.centerY() + 4f,
+                    statusPillTextPaint
+                )
+
+                // =========================================================
+                // 2B. VERIFIED GPS, LOCATION ADDRESS & NTP TIME LOCK STRIP
+                // =========================================================
+                val securityStripTop = 212f
+                val securityStripBottom = 232f
+                val stripBgPaint = Paint().apply {
+                    color = Color.rgb(241, 245, 249)
+                    style = Paint.Style.FILL
+                }
+                canvas.drawRoundRect(
+                    RectF(MARGIN_X, securityStripTop, PAGE_WIDTH - MARGIN_X, securityStripBottom),
+                    5f,
+                    5f,
+                    stripBgPaint
+                )
+                canvas.drawRoundRect(
+                    RectF(MARGIN_X, securityStripTop, PAGE_WIDTH - MARGIN_X, securityStripBottom),
+                    5f,
+                    5f,
+                    tableBorderPaint
+                )
+                val gpsLabel = currentLog.gpsCoordinates.ifBlank { "Location not fixed" }
+                val addressLabel = currentLog.locationAddress.ifBlank { "Offline / Address unavailable" }
+                val timeAuthLabel = currentLog.timeSource.ifBlank { "NTP Network Time Locked" }
+                val stripTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = 9.2f
+                }
+                val stripSummary = "GPS: $gpsLabel  |  Address: $addressLabel  |  Time: $timeAuthLabel"
+                drawBidiBoundedText(
+                    canvas = canvas,
+                    text = stripSummary,
+                    x = MARGIN_X + 8f,
+                    yTop = securityStripTop + 2f,
+                    maxWidth = PAGE_WIDTH - (MARGIN_X * 2f) - 16f,
+                    maxHeight = 16f,
+                    paint = stripTextPaint
+                )
+
+                // =========================================================
+                // 3. WEEKLY 7-DAY ATTENDANCE GRID (Mon -> Sun)
+                // =========================================================
+                val tableLeft = MARGIN_X
+                val tableRight = PAGE_WIDTH - MARGIN_X
+                val tableTop = 240f
+                val headerRowHeight = 29f
+                val dataRowHeight = 30f
+
+                // Column boundaries summing to 786f
+                val colXs = floatArrayOf(
+                    tableLeft,           // 28f  (Day / Date: 238f)
+                    tableLeft + 238f,    // 266f (Check In: 138f)
+                    tableLeft + 376f,    // 404f (Check Out: 138f)
+                    tableLeft + 514f,    // 542f (Duty Hours: 136f)
+                    tableLeft + 650f,    // 678f (Status: 136f)
+                    tableRight           // 814f
+                )
+
+                // Table header background
+                canvas.drawRect(
+                    tableLeft,
+                    tableTop,
+                    tableRight,
+                    tableTop + headerRowHeight,
+                    headerFillPaint
+                )
+
+                val headers = listOf("Day / Date", "Check In", "Check Out", "Duty Hours", "Status")
+                val headerTextY = tableTop + 19f
+                headers.forEachIndexed { idx, title ->
+                    val centerX = (colXs[idx] + colXs[idx + 1]) / 2f
+                    canvas.drawText(title, centerX, headerTextY, tableHeaderTextPaint)
+                }
+
+                // Data Rows
+                val checkCirclePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = greenBadgeColor
+                    style = Paint.Style.FILL
+                }
+                val checkMarkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE
+                    style = Paint.Style.STROKE
+                    strokeWidth = 2.0f
+                    strokeCap = Paint.Cap.ROUND
+                    strokeJoin = Paint.Join.ROUND
+                }
+
+                weeklySummary.rows.forEachIndexed { index, row ->
+                    val rTop = tableTop + headerRowHeight + (index * dataRowHeight)
+                    val rBottom = rTop + dataRowHeight
+                    val textBaselineY = rTop + 20f
+
+                    // Day / Date (left padded)
+                    canvas.drawText(row.dayDateLabel, colXs[0] + 12f, textBaselineY, cellLeftTextPaint)
+
+                    // Check In
+                    canvas.drawText(
+                        row.checkInLabel,
+                        (colXs[1] + colXs[2]) / 2f,
+                        textBaselineY,
+                        cellTextPaint
+                    )
+
+                    // Check Out
+                    canvas.drawText(
+                        row.checkOutLabel,
+                        (colXs[2] + colXs[3]) / 2f,
+                        textBaselineY,
+                        cellTextPaint
+                    )
+
+                    // Duty Hours
+                    canvas.drawText(
+                        row.dutyHoursLabel,
+                        (colXs[3] + colXs[4]) / 2f,
+                        textBaselineY,
+                        cellTextPaint
+                    )
+
+                    // Status cell
+                    val statusCenterX = (colXs[4] + colXs[5]) / 2f
+                    if (row.isPresent) {
+                        val iconCx = statusCenterX - 24f
+                        val iconCy = rTop + (dataRowHeight / 2f)
+                        canvas.drawCircle(iconCx, iconCy, 8f, checkCirclePaint)
+                        val tick = Path().apply {
+                            moveTo(iconCx - 3.6f, iconCy + 0.2f)
+                            lineTo(iconCx - 1.0f, iconCy + 3.0f)
+                            lineTo(iconCx + 3.8f, iconCy - 2.6f)
+                        }
+                        canvas.drawPath(tick, checkMarkPaint)
+                        canvas.drawText("Present", statusCenterX + 12f, textBaselineY, cellTextPaint)
+                    } else {
+                        canvas.drawText("--", statusCenterX, textBaselineY, cellTextPaint)
+                    }
+
+                    // Horizontal row bottom grid line
+                    canvas.drawLine(tableLeft, rBottom, tableRight, rBottom, tableBorderPaint)
+                }
+
+                val tableBottom = tableTop + headerRowHeight + (weeklySummary.rows.size * dataRowHeight)
+                // Outer border & header bottom line & vertical grid dividers
+                canvas.drawRect(tableLeft, tableTop, tableRight, tableBottom, tableBorderPaint)
+                canvas.drawLine(tableLeft, tableTop + headerRowHeight, tableRight, tableTop + headerRowHeight, tableBorderPaint)
+                for (i in 1 until colXs.size - 1) {
+                    canvas.drawLine(colXs[i], tableTop, colXs[i], tableBottom, tableBorderPaint)
+                }
+
+                // =========================================================
+                // 4. FOOTER RULE & SIGNATURES
+                // =========================================================
+                val footerRuleY = 508f
+                canvas.drawLine(MARGIN_X, footerRuleY, PAGE_WIDTH - MARGIN_X, footerRuleY, linePaint)
+
+                canvas.drawText("Report Generated On:", MARGIN_X, 534f, footerBoldPaint)
+                canvas.drawText(weeklySummary.generatedOnLabel, MARGIN_X, 551f, footerRegularPaint)
+
+                // Center HR Manager Signature Line
+                val hrLineLeft = 308f
+                val hrLineRight = 508f
+                canvas.drawLine(hrLineLeft, 550f, hrLineRight, 550f, thinDividerPaint)
+                canvas.drawText(
+                    "HR Manager",
+                    (hrLineLeft + hrLineRight) / 2f,
+                    567f,
+                    TextPaint(footerBoldPaint).apply { textAlign = Paint.Align.CENTER }
+                )
+
+                // Right Authorized Signature Flourish + Line
+                val authLineLeft = 594f
+                val authLineRight = 794f
+                val sigPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.rgb(30, 64, 175)
+                    style = Paint.Style.STROKE
+                    strokeWidth = 1.9f
+                    strokeCap = Paint.Cap.ROUND
+                    strokeJoin = Paint.Join.ROUND
+                }
+                val sigPath = Path().apply {
+                    moveTo(656f, 542f)
+                    cubicTo(648f, 520f, 672f, 514f, 666f, 538f)
+                    cubicTo(662f, 546f, 682f, 530f, 688f, 540f)
+                    cubicTo(692f, 545f, 704f, 528f, 712f, 539f)
+                    cubicTo(718f, 544f, 728f, 532f, 738f, 538f)
+                }
+                canvas.drawPath(sigPath, sigPaint)
+                canvas.drawLine(authLineLeft, 550f, authLineRight, 550f, thinDividerPaint)
+                canvas.drawText(
+                    "Authorized Signature",
+                    (authLineLeft + authLineRight) / 2f,
+                    567f,
+                    TextPaint(footerBoldPaint).apply { textAlign = Paint.Align.CENTER }
                 )
 
                 document.finishPage(page)
@@ -375,10 +686,120 @@ object AttendancePdfGenerator {
         }
     }
 
-    /**
-     * Renders mixed English/Urdu text safely with directional isolates and strict clip bounds
-     * so RTL words never flip LTR parentheses, hyphens, or timestamps and never overlap adjacent columns.
-     */
+    private fun drawFramedPortraitBox(
+        canvas: Canvas,
+        rect: RectF,
+        photoPath: String?,
+        fallbackInitials: String,
+        borderPaint: Paint,
+        caption: String,
+        darkInk: Int,
+        mutedInk: Int
+    ) {
+        val portraitBitmap = decodeSampledBitmap(photoPath, 320)
+        if (portraitBitmap != null) {
+            canvas.save()
+            val clipPath = Path().apply {
+                addRoundRect(rect, 10f, 10f, Path.Direction.CW)
+            }
+            canvas.clipPath(clipPath)
+            val srcRect = centerCropRect(portraitBitmap.width, portraitBitmap.height, 1f)
+            canvas.drawBitmap(
+                portraitBitmap,
+                srcRect,
+                rect,
+                Paint(Paint.FILTER_BITMAP_FLAG)
+            )
+            portraitBitmap.recycle()
+            canvas.restore()
+        } else {
+            val emptyPhotoBg = Paint().apply {
+                color = Color.rgb(241, 245, 249)
+                style = Paint.Style.FILL
+            }
+            canvas.drawRoundRect(rect, 10f, 10f, emptyPhotoBg)
+            canvas.drawText(
+                fallbackInitials,
+                rect.centerX(),
+                rect.centerY() + 6f,
+                TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = darkInk
+                    textSize = if (fallbackInitials.length <= 2) 22f else 15f
+                    typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                    textAlign = Paint.Align.CENTER
+                }
+            )
+        }
+        canvas.drawRoundRect(rect, 10f, 10f, borderPaint)
+        canvas.drawText(
+            caption,
+            rect.centerX(),
+            rect.bottom + 13f,
+            TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = mutedInk
+                textSize = 8.5f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                textAlign = Paint.Align.CENTER
+            }
+        )
+    }
+
+    private fun centerCropRect(srcW: Int, srcH: Int, targetAspect: Float): Rect {
+        val srcAspect = srcW.toFloat() / srcH.toFloat().coerceAtLeast(1f)
+        return if (srcAspect > targetAspect) {
+            val newW = (srcH * targetAspect).toInt().coerceIn(1, srcW)
+            val left = (srcW - newW) / 2
+            Rect(left, 0, left + newW, srcH)
+        } else {
+            val newH = (srcW / targetAspect).toInt().coerceIn(1, srcH)
+            val top = (srcH - newH) / 2
+            Rect(0, top, srcW, top + newH)
+        }
+    }
+
+    private fun parseDateKeyCalendar(dateKey: String): Calendar? {
+        if (dateKey.isBlank()) return null
+        return runCatching {
+            val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }
+            val parsed = fmt.parse(dateKey.trim()) ?: return null
+            Calendar.getInstance().apply { time = parsed }
+        }.getOrNull()
+    }
+
+    internal fun parseTimeLabelMinutes(timeLabel: String): Int? {
+        val trimmed = timeLabel.trim()
+        if (trimmed.isEmpty() || trimmed == "--") return null
+        val patterns = listOf("hh:mm:ss a", "h:mm:ss a", "hh:mm a", "h:mm a", "HH:mm:ss", "HH:mm")
+        for (pattern in patterns) {
+            val parsed = runCatching {
+                val fmt = SimpleDateFormat(pattern, Locale.US)
+                fmt.parse(trimmed)
+            }.getOrNull()
+            if (parsed != null) {
+                val cal = Calendar.getInstance().apply { time = parsed }
+                return cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+            }
+        }
+        return null
+    }
+
+    private fun formatShortTimeLabel(raw: String): String {
+        if (raw == "--" || raw.isBlank()) return "--"
+        val minutes = parseTimeLabelMinutes(raw) ?: return raw
+        val cal = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, minutes / 60)
+            set(Calendar.MINUTE, minutes % 60)
+        }
+        return SimpleDateFormat("hh:mm a", Locale.US).format(cal.time)
+    }
+
+    private fun formatDurationHoursMinutes(totalMinutes: Int): String {
+        val safe = totalMinutes.coerceAtLeast(0)
+        val hours = safe / 60
+        val mins = safe % 60
+        return String.format(Locale.US, "%02d:%02d Hrs", hours, mins)
+    }
+
     private fun drawBidiBoundedText(
         canvas: Canvas,
         text: String,
@@ -428,57 +849,59 @@ object AttendancePdfGenerator {
 
     private fun writeFallbackPdf14(
         outFile: File,
-        eventType: AttendanceEventType,
-        logDateKey: String,
-        rows: List<Pair<String, String>>,
-        todaysLogs: List<AttendanceLog>,
+        employee: Employee,
+        currentLog: AttendanceLog,
+        weeklySummary: WeeklyReportSummary,
         recipientEmail: String,
-        liveSelfiePath: String?
+        portraitPath: String?
     ) {
-        val checkInsToday = todaysLogs.count { it.eventType == AttendanceEventType.CHECK_IN.wireValue }
-        val checkOutsToday = todaysLogs.count { it.eventType == AttendanceEventType.CHECK_OUT.wireValue }
-
+        val cardNo = employee.checkInCode.ifBlank { employee.passcode }.ifBlank { employee.employeeCode }
+        val gpsText = currentLog.gpsCoordinates.ifBlank { "Unavailable" }
+        val addrText = currentLog.locationAddress.ifBlank { "Unavailable" }
+        val timeAuth = currentLog.timeSource.ifBlank { "NTP Network Time Locked" }
         val lines = buildList {
-            add("NICH EMPLOYEE ATTENDANCE 3 - ${eventType.displayLabel} REPORT")
-            add("AUTOMATED BIOMETRIC & PASSCODE ATTENDANCE SYSTEM")
-            add("------------------------------------------------------------")
-            rows.forEach { (label, value) ->
-                add("$label: ${BidiTextHelper.stripBidiControls(value)}")
-            }
-            if (!liveSelfiePath.isNullOrBlank()) {
-                val selfieFile = File(liveSelfiePath)
-                if (selfieFile.exists()) {
-                    add("Live Verification Selfie: Embedded (${selfieFile.name}, ${selfieFile.length()} bytes)")
+            add("NICH EMPLOYEE ATTENDANCE 3  |  WEEKLY ATTENDANCE REPORT  |  ATTENDANCE MANAGEMENT SYSTEM")
+            add(weeklySummary.weekRangeLabel)
+            add("------------------------------------------------------------------------------------")
+            add("Employee Name: ${BidiTextHelper.stripBidiControls(employee.name)}")
+            add("Employee ID: ${employee.employeeCode}   Department: ${employee.department}   Card No: $cardNo")
+            add("Total Working Days: ${weeklySummary.totalWorkingDays}   Total Duty Hours: ${weeklySummary.totalDutyHoursLabel}   Status: ${weeklySummary.overallStatusLabel}")
+            add("GPS Coordinates: $gpsText   |   Time Sync: $timeAuth")
+            add("Location Address: $addrText")
+            if (!portraitPath.isNullOrBlank()) {
+                val photoFile = File(portraitPath)
+                if (photoFile.exists()) {
+                    add("Live Capture Photo: Embedded (${photoFile.name}, ${photoFile.length()} bytes)")
                 }
             }
-            add("------------------------------------------------------------")
-            add("DAILY TERMINAL ACTIVITY ($logDateKey)")
-            add("Total Logged: ${todaysLogs.size} | Check-Ins: $checkInsToday | Check-Outs: $checkOutsToday")
-            todaysLogs.take(5).forEachIndexed { idx, item ->
-                add("${idx + 1}. ${BidiTextHelper.stripBidiControls(item.employeeName)} (${item.employeeCode}) - ${item.eventType} at ${item.loggedTimeLabel}")
+            add("------------------------------------------------------------------------------------")
+            add("Day / Date                 | Check In  | Check Out | Duty Hours | Status")
+            weeklySummary.rows.forEach { row ->
+                val statusStr = if (row.isPresent) "Present" else "--"
+                add("${row.dayDateLabel.padEnd(26)} | ${row.checkInLabel.padEnd(9)} | ${row.checkOutLabel.padEnd(9)} | ${row.dutyHoursLabel.padEnd(10)} | $statusStr")
             }
-            add("------------------------------------------------------------")
-            add("Dispatched automatically to $recipientEmail")
+            add("------------------------------------------------------------------------------------")
+            add("Report Generated On: ${weeklySummary.generatedOnLabel}   |   Recipient: $recipientEmail")
         }
 
         writeSimpleAsciiLinesPdf(outFile, lines)
     }
 
     private fun writeSimpleAsciiLinesPdf(outFile: File, lines: List<String>) {
-        val maxLinesPerDoc = lines.take(40)
+        val maxLinesPerDoc = lines.take(28)
         val contentStream = buildString {
             append("BT\n")
             append("/F1 10 Tf\n")
-            var cursorY = 795
+            var cursorY = 555
             maxLinesPerDoc.forEachIndexed { idx, rawLine ->
                 val safe = escapePdfText(rawLine)
                 if (idx == 0) {
-                    append("36 $cursorY Td\n")
+                    append("28 $cursorY Td\n")
                 } else {
-                    append("0 -17 Td\n")
+                    append("0 -18 Td\n")
                 }
                 append("($safe) Tj\n")
-                cursorY -= 17
+                cursorY -= 18
             }
             append("ET\n")
         }
@@ -486,9 +909,9 @@ object AttendancePdfGenerator {
         val objects = listOf(
             "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
             "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
             "4 0 obj\n<< /Length ${contentStream.toByteArray(Charsets.US_ASCII).size} >>\nstream\n${contentStream}endstream\nendobj\n",
-            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>\nendobj\n"
         )
 
         val pdfBuilder = StringBuilder()
@@ -521,11 +944,11 @@ object AttendancePdfGenerator {
                     '(' -> append("\\(")
                     ')' -> append("\\)")
                     in ' '..'~' -> append(ch)
-                    '•', '—' -> append('-')
+                    '•', '—', '–' -> append('-')
                     else -> if (ch.code > 0x007F) append('?') else Unit
                 }
             }
         }
-        return ascii.take(104)
+        return ascii.take(120)
     }
 }

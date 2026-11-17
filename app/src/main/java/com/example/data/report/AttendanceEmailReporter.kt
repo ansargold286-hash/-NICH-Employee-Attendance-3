@@ -229,12 +229,15 @@ class AttendanceEmailReporter(
             appendLine("Verification Method: ${verificationMethod.displayLabel}")
             appendLine("Match Confidence: ${confidenceScore.coerceIn(0, 100)}%")
             appendLine("Timestamp: ${log.loggedTimeLabel} (${log.loggedDateKey})")
+            appendLine("Time Authority: ${log.timeSource.ifBlank { "Network Time (NTP)" }}")
+            appendLine("GPS Coordinates: ${log.gpsCoordinates.ifBlank { "Unavailable" }}")
+            appendLine("Location Address: ${log.locationAddress.ifBlank { "Unavailable" }}")
             appendLine("Cloud Sync: ${if (syncedToCloud) "Cloud Firestore Live" else "Saved Offline (Queued)"}")
             if (!deviceAccountEmail.isNullOrBlank()) {
                 appendLine("Dispatched From Device Account: $deviceAccountEmail")
             }
             appendLine()
-            appendLine("The structured PDF attendance report (with live verification selfie) is attached.")
+            appendLine("The structured PDF attendance report (with live capture photo, GPS address, and weekly summary) is attached.")
         }
     }
 

@@ -6,10 +6,10 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,24 +17,27 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ErrorOutline
-import androidx.compose.material.icons.rounded.PersonAdd
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
@@ -45,6 +48,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -80,8 +84,8 @@ fun TerminalDashboardScreen(
     onFrameAnalyzed: (FaceAnalysisFrame) -> Unit,
     onSendCheckOutEmail: () -> Unit,
     onResetTerminal: () -> Unit,
-    enrolledFacesCount: Int = 0,
-    onOpenRegistration: (() -> Unit)? = null,
+    onAttemptSkipCheckOutEmail: () -> Unit = {},
+    networkTimeLabel: String = "NTP Network Time",
     modifier: Modifier = Modifier
 ) {
     LaunchedEffect(terminalPhase) {
@@ -90,10 +94,18 @@ fun TerminalDashboardScreen(
         }
     }
 
-    if (terminalPhase is TerminalUiPhase.Failure ||
-        (terminalPhase is TerminalUiPhase.Verified && terminalPhase.eventType == AttendanceEventType.CHECK_OUT)
-    ) {
+    if (terminalPhase is TerminalUiPhase.Failure) {
         BackHandler { onResetTerminal() }
+    } else if (terminalPhase is TerminalUiPhase.Verified &&
+        terminalPhase.eventType == AttendanceEventType.CHECK_OUT
+    ) {
+        BackHandler {
+            if (terminalPhase.isCheckOutEmailCompleted) {
+                onResetTerminal()
+            } else {
+                onAttemptSkipCheckOutEmail()
+            }
+        }
     }
 
     val activeSteps = (terminalPhase as? TerminalUiPhase.Scanning)?.livenessSteps
@@ -115,63 +127,70 @@ fun TerminalDashboardScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // Subtle live quality / matching guidance pill at the top center
-        val qualityHint = (terminalPhase as? TerminalUiPhase.Scanning)?.qualityHint
-        if (!qualityHint.isNullOrBlank()) {
+        // Subtle live AI voice, anti-spoofing liveness & NTP time lock pill at the top center
+        val scanningPhase = terminalPhase as? TerminalUiPhase.Scanning
+        val qualityHint = scanningPhase?.qualityHint
+        if (scanningPhase != null) {
+            val pillText = qualityHint?.takeIf { it.isNotBlank() }
+                ?: if (scanningPhase.livenessVerified) {
+                    "Liveness Verified • $networkTimeLabel"
+                } else {
+                    stringResource(R.string.liveness_blink_or_smile_hint)
+                }
+            val pillBorderColor = when {
+                scanningPhase.spoofSuspected -> NeonRed.copy(alpha = 0.85f)
+                scanningPhase.livenessVerified -> NeonGreen.copy(alpha = 0.75f)
+                else -> NeonCyan.copy(alpha = 0.45f)
+            }
+            val pillIconTint = when {
+                scanningPhase.spoofSuspected -> NeonRed
+                scanningPhase.livenessVerified -> NeonGreen
+                else -> NeonCyan
+            }
             Surface(
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(14.dp),
                 color = ObsidianSurface.copy(alpha = 0.88f),
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .safeDrawingPadding()
                     .padding(top = 18.dp, start = 24.dp, end = 24.dp)
-                    .border(1.dp, NeonCyan.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                    .border(1.dp, pillBorderColor, RoundedCornerShape(14.dp))
+                    .testTag("scanner_voice_guidance_pill")
             ) {
-                Text(
-                    text = qualityHint,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextPrimary,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
-                )
+                Column(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.VolumeUp,
+                            contentDescription = stringResource(R.string.voice_assistant_active),
+                            tint = pillIconTint,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = pillText,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = TextPrimary,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                    Text(
+                        text = networkTimeLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.testTag("network_time_lock_badge")
+                    )
+                }
             }
         }
 
-        // Bottom-left action pill to open Multi-Employee Local Registration Form
-        if (onOpenRegistration != null && terminalPhase is TerminalUiPhase.Scanning) {
-            OutlinedButton(
-                onClick = onOpenRegistration,
-                shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(1.2.dp, NeonCyan.copy(alpha = 0.72f)),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = ObsidianSurface.copy(alpha = 0.88f),
-                    contentColor = NeonCyan
-                ),
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .navigationBarsPadding()
-                    .padding(start = 20.dp, bottom = 22.dp)
-                    .minimumInteractiveComponentSize()
-                    .testTag("open_registration_button")
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.PersonAdd,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = if (enrolledFacesCount > 0) {
-                        "Register Staff ($enrolledFacesCount)"
-                    } else {
-                        "Register Staff"
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-        }
-
+        // Bottom Register/Add Employee button intentionally omitted after first-time setup.
         // Transient confirmation overlay when attendance is logged
         AnimatedVisibility(
             visible = terminalPhase is TerminalUiPhase.Verified,
@@ -183,7 +202,8 @@ fun TerminalDashboardScreen(
             if (verified != null) {
                 VerificationSuccessOverlay(
                     phase = verified,
-                    onSendCheckOutEmail = onSendCheckOutEmail
+                    onSendCheckOutEmail = onSendCheckOutEmail,
+                    onAttemptDismiss = onAttemptSkipCheckOutEmail
                 )
             }
         }
@@ -209,17 +229,32 @@ fun TerminalDashboardScreen(
 @Composable
 private fun VerificationSuccessOverlay(
     phase: TerminalUiPhase.Verified,
-    onSendCheckOutEmail: () -> Unit
+    onSendCheckOutEmail: () -> Unit,
+    onAttemptDismiss: () -> Unit
 ) {
     val accent = if (phase.eventType == AttendanceEventType.CHECK_IN) NeonGreen else NeonCyan
-    val registeredPhotoBitmap = remember(phase.employee.localPhotoPath, phase.liveSelfiePath) {
+    val registeredPhotoBitmap = remember(phase.employee.localPhotoPath) {
         val registeredPath = phase.employee.localPhotoPath.takeIf { it.isNotBlank() }
-        val chosenPath = registeredPath ?: phase.liveSelfiePath
-        if (chosenPath.isNullOrBlank()) {
+        if (registeredPath.isNullOrBlank()) {
             null
         } else {
             runCatching {
-                val file = File(chosenPath)
+                val file = File(registeredPath)
+                if (file.exists() && file.length() > 0L) {
+                    BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
+                } else {
+                    null
+                }
+            }.getOrNull()
+        }
+    }
+    val liveSelfieBitmap = remember(phase.liveSelfiePath) {
+        val selfiePath = phase.liveSelfiePath.takeIf { !it.isNullOrBlank() }
+        if (selfiePath.isNullOrBlank()) {
+            null
+        } else {
+            runCatching {
+                val file = File(selfiePath)
                 if (file.exists() && file.length() > 0L) {
                     BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
                 } else {
@@ -229,73 +264,136 @@ private fun VerificationSuccessOverlay(
         }
     }
 
+    val cardBorderColor = if (phase.emailEnforcementWarningActive) NeonRed else accent
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(ObsidianVoid.copy(alpha = 0.56f))
-            .safeDrawingPadding()
-            .padding(horizontal = 24.dp)
+            .background(ObsidianVoid.copy(alpha = 0.62f))
             .testTag("verification_successful_overlay"),
         contentAlignment = Alignment.Center
     ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(phase.eventType, phase.isCheckOutEmailCompleted) {
+                    detectTapGestures {
+                        if (phase.eventType == AttendanceEventType.CHECK_OUT && !phase.isCheckOutEmailCompleted) {
+                            onAttemptDismiss()
+                        }
+                    }
+                }
+        )
         Surface(
             shape = RoundedCornerShape(24.dp),
-            color = ObsidianSurface.copy(alpha = 0.96f),
+            color = ObsidianSurface.copy(alpha = 0.97f),
             tonalElevation = 10.dp,
             modifier = Modifier
+                .safeDrawingPadding()
+                .padding(horizontal = 24.dp, vertical = 16.dp)
                 .fillMaxWidth()
                 .widthIn(max = 420.dp)
-                .border(2.dp, accent, RoundedCornerShape(24.dp))
+                .pointerInput(Unit) {
+                    detectTapGestures { /* Consume taps inside the card without merging semantics descendants */ }
+                }
+                .border(2.dp, cardBorderColor, RoundedCornerShape(24.dp))
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 24.dp, vertical = 22.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Row(
+                    modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Icon(
-                        imageVector = Icons.Rounded.CheckCircle,
-                        contentDescription = stringResource(R.string.verification_successful),
-                        tint = accent,
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = stringResource(R.string.verification_successful),
-                        style = MaterialTheme.typography.titleLarge,
-                        color = accent,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
-                if (registeredPhotoBitmap != null) {
-                    Box(
-                        modifier = Modifier
-                            .size(92.dp)
-                            .clip(CircleShape)
-                            .border(2.dp, accent, CircleShape)
-                            .background(ObsidianElevated),
-                        contentAlignment = Alignment.Center
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
                     ) {
-                        Image(
-                            bitmap = registeredPhotoBitmap,
-                            contentDescription = phase.employee.name,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
+                        Icon(
+                            imageVector = Icons.Rounded.CheckCircle,
+                            contentDescription = stringResource(R.string.verification_successful),
+                            tint = accent,
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = stringResource(R.string.verification_successful),
+                            style = MaterialTheme.typography.titleLarge,
+                            color = accent,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
-                } else {
-                    EmployeeAvatar(
-                        name = phase.employee.name,
-                        avatarKey = phase.employee.avatarKey,
-                        size = 86.dp,
-                        ringColor = accent
-                    )
+                    if (phase.eventType == AttendanceEventType.CHECK_OUT && !phase.isCheckOutEmailCompleted) {
+                        IconButton(
+                            onClick = onAttemptDismiss,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("close_checkout_overlay_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Close,
+                                contentDescription = stringResource(R.string.email_enforcement_title),
+                                tint = TextSecondary
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val primaryBitmap = liveSelfieBitmap ?: registeredPhotoBitmap
+                    if (primaryBitmap != null) {
+                        Box(
+                            modifier = Modifier
+                                .size(92.dp)
+                                .clip(CircleShape)
+                                .border(2.dp, accent, CircleShape)
+                                .background(ObsidianElevated),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Image(
+                                bitmap = primaryBitmap,
+                                contentDescription = phase.employee.name,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    } else {
+                        EmployeeAvatar(
+                            name = phase.employee.name,
+                            avatarKey = phase.employee.avatarKey,
+                            size = 86.dp,
+                            ringColor = accent
+                        )
+                    }
+                    if (liveSelfieBitmap != null && registeredPhotoBitmap != null) {
+                        Box(
+                            modifier = Modifier
+                                .size(76.dp)
+                                .clip(CircleShape)
+                                .border(1.5.dp, TextSecondary, CircleShape)
+                                .background(ObsidianElevated),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Image(
+                                bitmap = registeredPhotoBitmap,
+                                contentDescription = "Registered profile photo",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
                 }
 
                 Text(
@@ -315,10 +413,95 @@ private fun VerificationSuccessOverlay(
                     textAlign = TextAlign.Center
                 )
 
-                // Conditional Email Notification: shown & triggered ONLY on Check-Out
+                if (phase.gpsCoordinates.isNotBlank() || phase.locationAddress.isNotBlank() || phase.timeSourceLabel.isNotBlank()) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = ObsidianElevated,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, accent.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                            .testTag("verified_gps_ntp_card")
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            if (phase.gpsCoordinates.isNotBlank()) {
+                                Text(
+                                    text = "GPS: ${phase.gpsCoordinates}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = NeonCyan
+                                )
+                            }
+                            if (phase.locationAddress.isNotBlank()) {
+                                Text(
+                                    text = "Location: ${phase.locationAddress}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextPrimary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (phase.timeSourceLabel.isNotBlank()) {
+                                Text(
+                                    text = "Time Lock: ${phase.timeSourceLabel}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Conditional Email Notification + Mandatory Blocking Enforcement: shown & triggered ONLY on Check-Out
                 if (phase.eventType == AttendanceEventType.CHECK_OUT) {
                     val isSending = phase.emailReportStatus == EmailReportStatus.DISPATCHING
                     val isSent = phase.emailReportStatus == EmailReportStatus.SENT
+                    val showBlockingBanner = phase.emailEnforcementWarningActive && !phase.isCheckOutEmailCompleted
+
+                    if (showBlockingBanner) {
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = NeonRed.copy(alpha = 0.16f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(1.5.dp, NeonRed, RoundedCornerShape(14.dp))
+                                .testTag("email_enforcement_warning_banner")
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.Top,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.WarningAmber,
+                                    contentDescription = stringResource(R.string.email_enforcement_title),
+                                    tint = NeonRed,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        text = stringResource(R.string.email_enforcement_title),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = NeonRed,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = phase.emailEnforcementMessage
+                                            ?: stringResource(R.string.email_enforcement_blocking_message),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextPrimary,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     Button(
                         onClick = onSendCheckOutEmail,
                         enabled = !isSending,

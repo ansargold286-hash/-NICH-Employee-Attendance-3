@@ -333,7 +333,10 @@ class AttendanceRepository(
         confidenceScore: Int,
         loggedTimeLabel: String,
         loggedDateKey: String,
-        explicitLogId: String? = null
+        explicitLogId: String? = null,
+        gpsCoordinates: String = "",
+        locationAddress: String = "",
+        timeSource: String = ""
     ): Result<String> {
         val uid = requireUserId()
         require(employee.id.isNotBlank()) { "Employee ID must not be blank" }
@@ -351,6 +354,9 @@ class AttendanceRepository(
             "confidenceScore" to confidenceScore.coerceIn(0, 100),
             "loggedTimeLabel" to loggedTimeLabel,
             "loggedDateKey" to loggedDateKey,
+            "gpsCoordinates" to gpsCoordinates,
+            "locationAddress" to locationAddress,
+            "timeSource" to timeSource,
             "createdAt" to FieldValue.serverTimestamp()
         )
         return try {

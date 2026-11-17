@@ -11,9 +11,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
@@ -22,15 +25,21 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.data.local.OfflineAttendanceStore
-import com.example.data.model.FaceBiometricMatcher
+import com.example.data.location.AndroidLocationAddressProvider
 import com.example.data.report.AttendanceEmailReporter
 import com.example.data.repository.AttendanceRepository
+import com.example.data.time.SntpNetworkTimeProvider
 import com.example.ui.screens.EmployeeRegistrationScreen
+import com.example.ui.screens.StartupPermissionGateScreen
 import com.example.ui.screens.TerminalDashboardScreen
+import com.example.ui.screens.openAppSystemSettings
+import com.example.ui.screens.readStartupPermissionStatus
 import com.example.ui.theme.NichAttendanceTheme
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.viewmodel.AttendanceViewModel
 import com.example.ui.viewmodel.DataUiState
+import com.example.voice.AndroidVoiceAssistant
+import com.example.voice.VoicePromptScript
 import com.google.firebase.Firebase
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
@@ -64,6 +73,33 @@ private fun FirebaseAuth.authStateFlow(): Flow<FirebaseUser?> = callbackFlow {
 @Composable
 fun AppNavigation() {
     val context = LocalContext.current
+    var permissionStatus by remember {
+        mutableStateOf(readStartupPermissionStatus(context))
+    }
+
+    if (!permissionStatus.allGranted) {
+        val gateVoiceAssistant = remember(context) { AndroidVoiceAssistant(context) }
+        DisposableEffect(gateVoiceAssistant) {
+            onDispose { gateVoiceAssistant.shutdown() }
+        }
+        StartupPermissionGateScreen(
+            status = permissionStatus,
+            onRefreshPermissions = {
+                permissionStatus = readStartupPermissionStatus(context)
+            },
+            onSpeakPermissionWarning = {
+                gateVoiceAssistant.speak(
+                    VoicePromptScript.REQUIRED_PERMISSIONS_WARNING_PROMPT,
+                    flush = true
+                )
+            },
+            onOpenSystemSettings = {
+                openAppSystemSettings(context)
+            }
+        )
+        return
+    }
+
     val firebaseAuth: FirebaseAuth? = remember(context) {
         val ready = FirebaseApp.getApps(context).isNotEmpty() || FirebaseApp.initializeApp(context) != null
         if (ready) Firebase.auth else null
@@ -104,11 +140,17 @@ private fun StrictBiometricTerminalShell(
                 } else {
                     null
                 }
+                val voiceAssistant = AndroidVoiceAssistant(app)
+                val networkTimeProvider = SntpNetworkTimeProvider()
+                val locationProvider = AndroidLocationAddressProvider(app)
                 AttendanceViewModel(
                     offlineStore = offlineStore,
                     repository = cloudRepository,
                     currentUserId = currentUserId,
-                    emailReporter = emailReporter
+                    emailReporter = emailReporter,
+                    voiceSpeaker = voiceAssistant,
+                    networkTimeProvider = networkTimeProvider,
+                    locationProvider = locationProvider
                 )
             }
         }
@@ -117,11 +159,9 @@ private fun StrictBiometricTerminalShell(
     val context = LocalContext.current
     val terminalPhase by viewModel.terminalPhase.collectAsStateWithLifecycle()
     val showRegistration by viewModel.showRegistrationScreen.collectAsStateWithLifecycle()
+    val networkTimeStatus by viewModel.networkTimeStatus.collectAsStateWithLifecycle()
     val employeesUi by viewModel.employeesState.collectAsStateWithLifecycle()
     val employeesList = (employeesUi as? DataUiState.Success)?.data.orEmpty()
-    val enrolledFacesCount = remember(employeesList) {
-        employeesList.count { FaceBiometricMatcher.parseSignature(it.faceSignature) != null }
-    }
 
     Scaffold(
         modifier = Modifier
@@ -155,8 +195,8 @@ private fun StrictBiometricTerminalShell(
                         }
                     },
                     onResetTerminal = viewModel::resetToReady,
-                    enrolledFacesCount = enrolledFacesCount,
-                    onOpenRegistration = viewModel::openRegistrationScreen
+                    onAttemptSkipCheckOutEmail = viewModel::attemptSkipOrDismissCheckOut,
+                    networkTimeLabel = networkTimeStatus.sourceLabel
                 )
             }
         }

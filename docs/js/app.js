@@ -11,6 +11,9 @@ import { dispatchCheckOutEmailAndPdf } from './pdf-report.js';
 const VERIFIED_CHECK_IN_RESET_MS = 2500;
 const SAME_EMPLOYEE_COOLDOWN_MS = 3000;
 const FRAME_ANALYSIS_INTERVAL_MS = 240;
+const EMAIL_ENFORCEMENT_INTERVAL_MS = 6000;
+const MANDATORY_EMAIL_ENFORCEMENT_PROMPT =
+  'Please send the email! Without sending the email, your attendance and record will not be saved.';
 
 const els = {
   video: document.getElementById('cameraVideo'),
@@ -20,10 +23,12 @@ const els = {
   cloudSyncDot: document.getElementById('cloudSyncDot'),
   verifiedOverlay: document.getElementById('verifiedOverlay'),
   verifiedCard: document.getElementById('verifiedCard'),
+  closeCheckOutOverlayBtn: document.getElementById('closeCheckOutOverlayBtn'),
   verifiedSelfiePreview: document.getElementById('verifiedSelfiePreview'),
   verifiedEmployeeName: document.getElementById('verifiedEmployeeName'),
   verifiedMeta: document.getElementById('verifiedMeta'),
   checkOutActions: document.getElementById('checkOutActions'),
+  emailEnforcementBanner: document.getElementById('emailEnforcementBanner'),
   sendEmailFinishBtn: document.getElementById('sendEmailFinishBtn'),
   sendEmailBtnLabel: document.getElementById('sendEmailBtnLabel'),
   cameraFailureOverlay: document.getElementById('cameraFailureOverlay'),
@@ -51,13 +56,30 @@ const state = {
   activeStream: null,
   analysisTimer: null,
   resetTimer: null,
+  emailReminderTimer: null,
   analysisInFlight: false,
   drawerOpen: false,
   lastVerifiedEmployeeId: null,
   lastVerifiedAtMs: 0,
   currentVerifiedPayload: null,
+  checkOutEmailCompleted: true,
+  lastSpokenAtMs: 0,
   currentUser: null
 };
+
+function speakWebVoicePrompt(text, flush = false) {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window) || !text) return;
+  try {
+    if (flush) window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'en-US';
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    window.speechSynthesis.speak(utterance);
+  } catch {
+    // Ignore autoplay restrictions gracefully
+  }
+}
 
 async function startCameraFeed() {
   hideCameraFailure();
@@ -84,6 +106,7 @@ async function startCameraFeed() {
     els.video.srcObject = stream;
     await els.video.play();
     state.phase = 'SCANNING';
+    speakWebVoicePrompt('Welcome to NICH Attendance 3. Please look straight into the camera.', true);
     startFrameAnalysisLoop();
   } catch (err) {
     const message =
@@ -122,6 +145,11 @@ async function runSingleFrameCheck() {
     overlayController.setFaceDetected(analysis.faceDetected);
 
     if (!analysis.faceDetected || !analysis.signature) {
+      const nowMs = Date.now();
+      if (nowMs - state.lastSpokenAtMs > 9000) {
+        state.lastSpokenAtMs = nowMs;
+        speakWebVoicePrompt('Please align your face inside the blue scanner frame.');
+      }
       return;
     }
 
@@ -183,8 +211,16 @@ async function commitVerifiedAttendance(employee, confidenceScore, selfieDataUrl
   });
 
   state.currentVerifiedPayload = { employee, logEntry, selfieDataUrl };
+  state.checkOutEmailCompleted = eventType !== 'CHECK_OUT';
   renderVerifiedOverlay(employee, logEntry, selfieDataUrl);
   refreshOperatorDrawer();
+
+  speakWebVoicePrompt(
+    eventType === 'CHECK_OUT'
+      ? `Check-out verified for ${employee.name}. Please send the email to save and finish your record.`
+      : `Welcome, ${employee.name}. Check-in recorded successfully.`,
+    true
+  );
 
   // Sync to Cloud Firestore in background if signed in
   const uid = state.currentUser?.uid;
@@ -206,15 +242,39 @@ async function commitVerifiedAttendance(employee, confidenceScore, selfieDataUrl
   }
 
   // Check-In: NO email button, auto-return to live scanning after 2.5s
-  // Check-Out: KEEP overlay visible with Send Email & Finish button immediately
+  // Check-Out: KEEP overlay strictly locked with Send Email & Finish + repeating enforcement voice
   if (eventType === 'CHECK_IN') {
     state.resetTimer = setTimeout(resetToScanning, VERIFIED_CHECK_IN_RESET_MS);
+  } else {
+    startWebCheckOutEnforcementLoop();
   }
+}
+
+function triggerCheckOutEnforcementWarning() {
+  if (state.phase !== 'VERIFIED' || state.checkOutEmailCompleted) return;
+  els.verifiedCard.classList.add('is-enforcement-alert');
+  els.emailEnforcementBanner.classList.remove('hidden');
+  speakWebVoicePrompt(MANDATORY_EMAIL_ENFORCEMENT_PROMPT, true);
+}
+
+function startWebCheckOutEnforcementLoop() {
+  clearInterval(state.emailReminderTimer);
+  state.emailReminderTimer = setInterval(() => {
+    if (state.phase !== 'VERIFIED' || state.checkOutEmailCompleted) {
+      clearInterval(state.emailReminderTimer);
+      state.emailReminderTimer = null;
+      return;
+    }
+    triggerCheckOutEnforcementWarning();
+  }, EMAIL_ENFORCEMENT_INTERVAL_MS);
 }
 
 function renderVerifiedOverlay(employee, logEntry, selfieDataUrl) {
   const isCheckOut = logEntry.eventType === 'CHECK_OUT';
   els.verifiedCard.classList.toggle('is-checkout', isCheckOut);
+  els.verifiedCard.classList.remove('is-enforcement-alert');
+  els.closeCheckOutOverlayBtn.classList.toggle('hidden', !isCheckOut);
+  els.emailEnforcementBanner.classList.add('hidden');
   els.verifiedEmployeeName.textContent = employee.name;
   els.verifiedMeta.textContent = `${AttendanceTimeRules.displayLabel(logEntry.eventType)} • ${logEntry.loggedTimeLabel}`;
 
@@ -234,8 +294,15 @@ function renderVerifiedOverlay(employee, logEntry, selfieDataUrl) {
 }
 
 function resetToScanning() {
+  if (state.phase === 'VERIFIED' && !state.checkOutEmailCompleted) {
+    triggerCheckOutEnforcementWarning();
+    return;
+  }
   clearTimeout(state.resetTimer);
+  clearInterval(state.emailReminderTimer);
+  state.emailReminderTimer = null;
   state.currentVerifiedPayload = null;
+  state.checkOutEmailCompleted = true;
   els.verifiedOverlay.classList.add('hidden');
   state.phase = state.activeStream ? 'SCANNING' : 'CAMERA_ERROR';
 }
@@ -339,9 +406,25 @@ async function flushPendingCloudLogs(uid) {
 }
 
 // Event bindings
+els.closeCheckOutOverlayBtn.addEventListener('click', triggerCheckOutEnforcementWarning);
+
+els.verifiedOverlay.addEventListener('click', (e) => {
+  if (e.target === els.verifiedOverlay && !state.checkOutEmailCompleted) {
+    triggerCheckOutEnforcementWarning();
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && state.phase === 'VERIFIED' && !state.checkOutEmailCompleted) {
+    e.preventDefault();
+    triggerCheckOutEnforcementWarning();
+  }
+});
+
 els.sendEmailFinishBtn.addEventListener('click', async () => {
   const payload = state.currentVerifiedPayload;
   if (!payload) {
+    state.checkOutEmailCompleted = true;
     resetToScanning();
     return;
   }
@@ -354,8 +437,13 @@ els.sendEmailFinishBtn.addEventListener('click', async () => {
       selfieDataUrl: payload.selfieDataUrl,
       operatorEmail: state.currentUser?.email || ''
     });
-  } finally {
+    state.checkOutEmailCompleted = true;
+    speakWebVoicePrompt('Check-out email and report sent successfully. Attendance saved.', true);
     resetToScanning();
+  } catch {
+    els.sendEmailFinishBtn.disabled = false;
+    els.sendEmailBtnLabel.textContent = 'Send Email & Finish';
+    triggerCheckOutEnforcementWarning();
   }
 });
 

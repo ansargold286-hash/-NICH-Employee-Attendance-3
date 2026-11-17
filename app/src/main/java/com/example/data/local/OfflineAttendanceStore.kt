@@ -233,7 +233,10 @@ class OfflineAttendanceStore(context: Context) {
         loggedTimeLabel: String,
         loggedDateKey: String,
         synced: Boolean,
-        explicitLogId: String? = null
+        explicitLogId: String? = null,
+        gpsCoordinates: String = "",
+        locationAddress: String = "",
+        timeSource: String = ""
     ): AttendanceLog {
         val logId = explicitLogId ?: "log_${UUID.randomUUID().toString().replace("-", "").take(20)}"
         val entry = AttendanceLog(
@@ -248,6 +251,9 @@ class OfflineAttendanceStore(context: Context) {
             confidenceScore = confidenceScore.toLong().coerceIn(0L, 100L),
             loggedTimeLabel = loggedTimeLabel,
             loggedDateKey = loggedDateKey,
+            gpsCoordinates = gpsCoordinates,
+            locationAddress = locationAddress,
+            timeSource = timeSource,
             createdAt = Timestamp.now()
         )
         val updatedLogs = (listOf(entry) + _logs.value.filterNot { it.id == logId }).take(MAX_LOCAL_LOGS)
@@ -477,6 +483,9 @@ class OfflineAttendanceStore(context: Context) {
                     confidenceScore = obj.optLong("confidenceScore", 100L),
                     loggedTimeLabel = obj.optString("loggedTimeLabel", AttendanceTimeRules.formatTimeLabel()),
                     loggedDateKey = obj.optString("loggedDateKey", AttendanceTimeRules.formatDateKey()),
+                    gpsCoordinates = obj.optString("gpsCoordinates"),
+                    locationAddress = obj.optString("locationAddress"),
+                    timeSource = obj.optString("timeSource"),
                     createdAt = if (epochSec > 0L) Timestamp(epochSec, 0) else null
                 )
             }
@@ -502,6 +511,9 @@ class OfflineAttendanceStore(context: Context) {
                     put("confidenceScore", log.confidenceScore)
                     put("loggedTimeLabel", log.loggedTimeLabel)
                     put("loggedDateKey", log.loggedDateKey)
+                    put("gpsCoordinates", log.gpsCoordinates)
+                    put("locationAddress", log.locationAddress)
+                    put("timeSource", log.timeSource)
                     put("createdAtSec", log.createdAt?.seconds ?: (System.currentTimeMillis() / 1000L))
                 }
             )

@@ -228,12 +228,13 @@ fun BiometricCameraScanner(
 
                                         if (stepSnapshot == LivenessDirection.CENTER_VERIFY || lastSelfiePathRef.get() == null) {
                                             val nowMs = System.currentTimeMillis()
-                                            if (lastSelfiePathRef.get() == null || nowMs - lastSelfieWriteMs.get() >= 220L) {
+                                            if (lastSelfiePathRef.get() == null || nowMs - lastSelfieWriteMs.get() >= 80L) {
                                                 val capturedPath = captureRotatedSelfieFile(
                                                     context = appContext,
                                                     imageProxy = imageProxy,
                                                     isFrontCamera = frontCam,
-                                                    rotationDegrees = rotationDeg
+                                                    rotationDegrees = rotationDeg,
+                                                    maxKeepCount = 8
                                                 )
                                                 if (capturedPath != null) {
                                                     lastSelfiePathRef.set(capturedPath)
@@ -257,7 +258,9 @@ fun BiometricCameraScanner(
                                                                 face = primaryFace,
                                                                 targetDirection = activeDirectionRef.get(),
                                                                 isFrontCamera = frontCam,
-                                                                capturedSelfiePath = selfieForFrame
+                                                                capturedSelfiePath = selfieForFrame,
+                                                                frameWidth = inputImage.width,
+                                                                frameHeight = inputImage.height
                                                             )
                                                         )
                                                     } else {
@@ -688,11 +691,15 @@ internal fun analyzeFaceBiometrics(
     face: Face,
     targetDirection: LivenessDirection = LivenessDirection.CENTER_VERIFY,
     isFrontCamera: Boolean = true,
-    capturedSelfiePath: String? = null
+    capturedSelfiePath: String? = null,
+    frameWidth: Int = 0,
+    frameHeight: Int = 0
 ): FaceAnalysisFrame {
     val box: Rect = face.boundingBox
     val boxW = box.width().toFloat().coerceAtLeast(1f)
     val boxH = box.height().toFloat().coerceAtLeast(1f)
+    val centerXNorm = if (frameWidth > 0) (box.exactCenterX() / frameWidth.toFloat()).coerceIn(0f, 1f) else null
+    val centerYNorm = if (frameHeight > 0) (box.exactCenterY() / frameHeight.toFloat()).coerceIn(0f, 1f) else null
 
     val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
     val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
@@ -722,6 +729,7 @@ internal fun analyzeFaceBiometrics(
 
     val leftOpenProb = face.leftEyeOpenProbability
     val rightOpenProb = face.rightEyeOpenProbability
+    val smilingProb = face.smilingProbability
     val livenessOpenEyes = (leftOpenProb == null || leftOpenProb >= 0.25f) &&
         (rightOpenProb == null || rightOpenProb >= 0.25f)
 
@@ -743,6 +751,11 @@ internal fun analyzeFaceBiometrics(
             headYawDeg = yaw,
             headPitchDeg = pitch,
             headRollDeg = roll,
+            leftEyeOpenProbability = leftOpenProb,
+            rightEyeOpenProbability = rightOpenProb,
+            smilingProbability = smilingProb,
+            faceCenterXNorm = centerXNorm,
+            faceCenterYNorm = centerYNorm,
             isFrontCamera = isFrontCamera,
             selfieImagePath = null,
             qualityIssue = if (directionMatched) null else targetDirection.instruction
@@ -763,6 +776,11 @@ internal fun analyzeFaceBiometrics(
             headYawDeg = yaw,
             headPitchDeg = pitch,
             headRollDeg = roll,
+            leftEyeOpenProbability = leftOpenProb,
+            rightEyeOpenProbability = rightOpenProb,
+            smilingProbability = smilingProb,
+            faceCenterXNorm = centerXNorm,
+            faceCenterYNorm = centerYNorm,
             isFrontCamera = isFrontCamera,
             selfieImagePath = capturedSelfiePath,
             qualityIssue = "Look straight into the camera so both eyes and face are clearly visible"
@@ -899,6 +917,11 @@ internal fun analyzeFaceBiometrics(
         headYawDeg = yaw,
         headPitchDeg = pitch,
         headRollDeg = roll,
+        leftEyeOpenProbability = leftOpenProb,
+        rightEyeOpenProbability = rightOpenProb,
+        smilingProbability = smilingProb,
+        faceCenterXNorm = centerXNorm,
+        faceCenterYNorm = centerYNorm,
         isFrontCamera = isFrontCamera,
         selfieImagePath = capturedSelfiePath,
         qualityIssue = if (headPoseAligned) null else "Face camera directly (keep head level)"

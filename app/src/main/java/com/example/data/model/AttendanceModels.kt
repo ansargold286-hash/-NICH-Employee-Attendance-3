@@ -50,6 +50,9 @@ data class AttendanceLog(
     val confidenceScore: Long = 0L,
     val loggedTimeLabel: String = "",
     val loggedDateKey: String = "",
+    val gpsCoordinates: String = "",
+    val locationAddress: String = "",
+    val timeSource: String = "",
     @ServerTimestamp val createdAt: Timestamp? = null
 )
 
@@ -220,10 +223,180 @@ data class FaceAnalysisFrame(
     val headYawDeg: Float = 0f,
     val headPitchDeg: Float = 0f,
     val headRollDeg: Float = 0f,
+    val leftEyeOpenProbability: Float? = null,
+    val rightEyeOpenProbability: Float? = null,
+    val smilingProbability: Float? = null,
+    val faceCenterXNorm: Float? = null,
+    val faceCenterYNorm: Float? = null,
     val isFrontCamera: Boolean = true,
     val selfieImagePath: String? = null,
     val qualityIssue: String? = null
 )
+
+data class AntiSpoofingCheckResult(
+    val livenessVerified: Boolean,
+    val spoofSuspected: Boolean,
+    val statusPrompt: String
+)
+
+/**
+ * Multi-frame anti-spoofing liveness tracker that defeats printed photos and mobile screenshots
+ * by requiring live biological signals from ML Kit:
+ * 1) Natural eye blink (open -> blink dip -> reopen), OR
+ * 2) Dynamic smile / expression transition (smile with expression shift or micro-motion), OR
+ * 3) Live 3D head pose motion accompanied by subtle eye/smile classification variation.
+ */
+class AntiSpoofingLivenessTracker {
+    private var frameCount = 0
+    private var sawOpenEyesBeforeBlink = false
+    private var sawBlinkDip = false
+    private var blinkCompleted = false
+    private var dynamicSmileCompleted = false
+    private var livenessLockedVerified = false
+
+    private var minEyeProb = 1f
+    private var maxEyeProb = 0f
+    private var minSmileProb = 1f
+    private var maxSmileProb = 0f
+
+    private var minYaw = Float.MAX_VALUE
+    private var maxYaw = -Float.MAX_VALUE
+    private var minPitch = Float.MAX_VALUE
+    private var maxPitch = -Float.MAX_VALUE
+    private var minCenterX = Float.MAX_VALUE
+    private var maxCenterX = -Float.MAX_VALUE
+
+    fun reset() {
+        frameCount = 0
+        sawOpenEyesBeforeBlink = false
+        sawBlinkDip = false
+        blinkCompleted = false
+        dynamicSmileCompleted = false
+        livenessLockedVerified = false
+        minEyeProb = 1f
+        maxEyeProb = 0f
+        minSmileProb = 1f
+        maxSmileProb = 0f
+        minYaw = Float.MAX_VALUE
+        maxYaw = -Float.MAX_VALUE
+        minPitch = Float.MAX_VALUE
+        maxPitch = -Float.MAX_VALUE
+        minCenterX = Float.MAX_VALUE
+        maxCenterX = -Float.MAX_VALUE
+    }
+
+    fun evaluate(frame: FaceAnalysisFrame): AntiSpoofingCheckResult {
+        if (!frame.faceDetected) {
+            if (frameCount > 0) reset()
+            return AntiSpoofingCheckResult(
+                livenessVerified = false,
+                spoofSuspected = false,
+                statusPrompt = "Position your live face inside the scanner frame"
+            )
+        }
+
+        frameCount++
+
+        if (frame.headYawDeg < minYaw) minYaw = frame.headYawDeg
+        if (frame.headYawDeg > maxYaw) maxYaw = frame.headYawDeg
+        if (frame.headPitchDeg < minPitch) minPitch = frame.headPitchDeg
+        if (frame.headPitchDeg > maxPitch) maxPitch = frame.headPitchDeg
+
+        val cx = frame.faceCenterXNorm
+        if (cx != null) {
+            if (cx < minCenterX) minCenterX = cx
+            if (cx > maxCenterX) maxCenterX = cx
+        }
+
+        val eyeProbs = listOfNotNull(frame.leftEyeOpenProbability, frame.rightEyeOpenProbability)
+        val avgEyeOpen = if (eyeProbs.isNotEmpty()) {
+            eyeProbs.average().toFloat()
+        } else if (!frame.livenessOpenEyes) {
+            0.15f
+        } else {
+            null
+        }
+
+        if (avgEyeOpen != null) {
+            if (avgEyeOpen < minEyeProb) minEyeProb = avgEyeOpen
+            if (avgEyeOpen > maxEyeProb) maxEyeProb = avgEyeOpen
+
+            if (!sawOpenEyesBeforeBlink && avgEyeOpen >= EYE_OPEN_THRESHOLD) {
+                sawOpenEyesBeforeBlink = true
+            } else if (sawOpenEyesBeforeBlink && !sawBlinkDip && avgEyeOpen <= EYE_BLINK_THRESHOLD) {
+                sawBlinkDip = true
+            } else if (sawBlinkDip && avgEyeOpen >= EYE_OPEN_THRESHOLD) {
+                blinkCompleted = true
+            }
+        }
+
+        val smile = frame.smilingProbability
+        if (smile != null) {
+            if (smile < minSmileProb) minSmileProb = smile
+            if (smile > maxSmileProb) maxSmileProb = smile
+        }
+
+        val yawSpan = (maxYaw - minYaw).coerceAtLeast(0f)
+        val pitchSpan = (maxPitch - minPitch).coerceAtLeast(0f)
+        val poseSpan = yawSpan + pitchSpan
+        val eyeSpan = (maxEyeProb - minEyeProb).coerceAtLeast(0f)
+        val smileSpan = (maxSmileProb - minSmileProb).coerceAtLeast(0f)
+        val centerShift = if (minCenterX <= maxCenterX) (maxCenterX - minCenterX) else 0f
+
+        if (smile != null && smile >= SMILE_ACTIVE_THRESHOLD &&
+            (smileSpan >= SMILE_DELTA_THRESHOLD || poseSpan >= 1.5f || centerShift >= 0.015f)
+        ) {
+            dynamicSmileCompleted = true
+        }
+
+        val natural3DMotionVerified = frameCount >= 2 &&
+            poseSpan >= MOTION_POSE_SPAN_THRESHOLD &&
+            (eyeSpan >= 0.04f || smileSpan >= 0.06f)
+
+        if (blinkCompleted || dynamicSmileCompleted || natural3DMotionVerified) {
+            livenessLockedVerified = true
+        }
+
+        if (livenessLockedVerified) {
+            return AntiSpoofingCheckResult(
+                livenessVerified = true,
+                spoofSuspected = false,
+                statusPrompt = "Liveness Verified • Face Scan Active"
+            )
+        }
+
+        val staticPhotoSuspected = frameCount >= STATIC_SPOOF_FRAME_LIMIT &&
+            poseSpan < 1.2f &&
+            centerShift < 0.01f &&
+            eyeSpan < 0.05f &&
+            smileSpan < 0.05f &&
+            !sawBlinkDip
+
+        val prompt = when {
+            staticPhotoSuspected ->
+                "Spoof Alert: Static photo or screen detected — Blink eyes or smile naturally"
+            sawBlinkDip ->
+                "Blink detected — Open eyes and look straight"
+            else ->
+                "Liveness Check: Blink your eyes or smile naturally"
+        }
+
+        return AntiSpoofingCheckResult(
+            livenessVerified = false,
+            spoofSuspected = staticPhotoSuspected,
+            statusPrompt = prompt
+        )
+    }
+
+    companion object {
+        private const val EYE_OPEN_THRESHOLD = 0.50f
+        private const val EYE_BLINK_THRESHOLD = 0.42f
+        private const val SMILE_ACTIVE_THRESHOLD = 0.55f
+        private const val SMILE_DELTA_THRESHOLD = 0.16f
+        private const val MOTION_POSE_SPAN_THRESHOLD = 7.0f
+        private const val STATIC_SPOOF_FRAME_LIMIT = 8
+    }
+}
 
 object FaceBiometricMatcher {
     const val MATCH_THRESHOLD_PERCENT = 50

@@ -87,6 +87,74 @@ class AttendanceReportTest {
     }
 
     @Test
+    fun buildWeeklySummary_aggregatesMondayToSundayDutyHoursAccurately() {
+        val employee = Employee(
+            id = "emp_ali",
+            employeeCode = "EMP-001",
+            name = "Ali Raza",
+            department = "Operations",
+            roleTitle = "Staff",
+            checkInCode = "1001"
+        )
+        val monIn = AttendanceLog(
+            id = "mon_in",
+            employeeId = employee.id,
+            employeeCode = employee.employeeCode,
+            employeeName = employee.name,
+            eventType = AttendanceEventType.CHECK_IN.wireValue,
+            loggedTimeLabel = "09:00:00 AM",
+            loggedDateKey = "2025-11-10"
+        )
+        val monOut = AttendanceLog(
+            id = "mon_out",
+            employeeId = employee.id,
+            employeeCode = employee.employeeCode,
+            employeeName = employee.name,
+            eventType = AttendanceEventType.CHECK_OUT.wireValue,
+            loggedTimeLabel = "05:00:00 PM",
+            loggedDateKey = "2025-11-10"
+        )
+        val sunOut = AttendanceLog(
+            id = "sun_out",
+            employeeId = employee.id,
+            employeeCode = employee.employeeCode,
+            employeeName = employee.name,
+            eventType = AttendanceEventType.CHECK_OUT.wireValue,
+            loggedTimeLabel = "05:10:00 PM",
+            loggedDateKey = "2025-11-16"
+        )
+        val sunIn = AttendanceLog(
+            id = "sun_in",
+            employeeId = employee.id,
+            employeeCode = employee.employeeCode,
+            employeeName = employee.name,
+            eventType = AttendanceEventType.CHECK_IN.wireValue,
+            loggedTimeLabel = "09:10:00 AM",
+            loggedDateKey = "2025-11-16"
+        )
+
+        val summary = AttendancePdfGenerator.buildWeeklySummary(
+            employee = employee,
+            currentLog = sunOut,
+            recentDailyLogs = listOf(monIn, monOut, sunIn, sunOut)
+        )
+
+        assertEquals(7, summary.rows.size)
+        assertEquals("Monday, 10 Nov 2025", summary.rows.first().dayDateLabel)
+        assertEquals("Sunday, 16 Nov 2025", summary.rows.last().dayDateLabel)
+        assertEquals("09:00 AM", summary.rows.first().checkInLabel)
+        assertEquals("05:00 PM", summary.rows.first().checkOutLabel)
+        assertEquals("08:00 Hrs", summary.rows.first().dutyHoursLabel)
+        assertEquals(true, summary.rows.first().isPresent)
+        assertEquals(false, summary.rows[1].isPresent)
+        assertEquals(2, summary.totalWorkingDays)
+        assertEquals("16:00 Hrs", summary.totalDutyHoursLabel)
+        assertEquals("Present", summary.overallStatusLabel)
+        assertTrue(summary.weekRangeLabel.contains("10 Nov 2025"))
+        assertTrue(summary.weekRangeLabel.contains("16 Nov 2025"))
+    }
+
+    @Test
     fun smtpEmailSender_executesCompleteMimeAttachmentHandshake() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val employee = Employee(

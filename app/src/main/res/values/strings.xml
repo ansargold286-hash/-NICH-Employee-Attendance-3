@@ -11,4 +11,13 @@
     <string name="capture_live_photo">Capture Live Photo</string>
     <string name="retake_photo">Retake Photo</string>
     <string name="open_scanner">Open Scanner</string>
+    <string name="email_enforcement_blocking_message">Please send the email! Without sending the email, your attendance and record will not be saved.</string>
+    <string name="email_enforcement_title">Mandatory Check-Out Email Required</string>
+    <string name="voice_assistant_active">AI Voice Guidance Active</string>
+    <string name="permissions_required_title">Camera &amp; GPS Permissions Required</string>
+    <string name="permissions_required_voice_warning">Please allow required permissions!</string>
+    <string name="permissions_required_body">Camera and GPS Location permissions are strictly required for anti-spoofing face verification, exact location stamping, and attendance logging. Startup is blocked until both permissions are enabled in System Settings.</string>
+    <string name="open_system_settings">Open System Settings</string>
+    <string name="recheck_permissions">Re-check Permissions</string>
+    <string name="liveness_blink_or_smile_hint">Liveness Check: Please blink or smile naturally</string>
 </resources>

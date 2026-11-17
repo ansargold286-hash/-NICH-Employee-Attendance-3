@@ -62,14 +62,24 @@
       aria-labelledby="verifiedTitle"
     >
       <div id="verifiedCard" class="terminal-card verified-card">
-        <div class="verified-header-row">
-          <svg class="status-icon" viewBox="0 0 24 24" aria-hidden="true">
-            <path
-              fill="currentColor"
-              d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"
-            />
-          </svg>
-          <h1 id="verifiedTitle" class="verified-title">Verification Successful</h1>
+        <div class="verified-header-bar">
+          <div class="verified-header-row">
+            <svg class="status-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"
+              />
+            </svg>
+            <h1 id="verifiedTitle" class="verified-title">Verification Successful</h1>
+          </div>
+          <button
+            id="closeCheckOutOverlayBtn"
+            type="button"
+            class="btn-icon-close hidden"
+            aria-label="Close check-out overlay"
+          >
+            ✕
+          </button>
         </div>
 
         <div id="verifiedAvatarRing" class="avatar-ring">
@@ -85,6 +95,12 @@
 
         <!-- Shown ONLY on Check-Out (hidden on Check-In) -->
         <div id="checkOutActions" class="checkout-actions hidden">
+          <div id="emailEnforcementBanner" class="enforcement-banner hidden" role="alert">
+            <strong class="enforcement-title">Mandatory Check-Out Email Required</strong>
+            <p class="enforcement-body">
+              Please send the email! Without sending the email, your attendance and record will not be saved.
+            </p>
+          </div>
           <button
             id="sendEmailFinishBtn"
             type="button"
