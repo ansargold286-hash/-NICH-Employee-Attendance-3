@@ -124,8 +124,13 @@ class OfflineAttendanceStoreTest {
 
         val tempPhoto1 = java.io.File(context.cacheDir, "temp_reg_1.jpg")
         val tempPhoto2 = java.io.File(context.cacheDir, "temp_reg_2.jpg")
-        tempPhoto1.writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()))
-        tempPhoto2.writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()))
+        val tempCnic1 = java.io.File(context.cacheDir, "temp_cnic_1.jpg")
+        val tempCnic2 = java.io.File(context.cacheDir, "temp_cnic_2.jpg")
+        val jpegBytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte())
+        tempPhoto1.writeBytes(jpegBytes)
+        tempPhoto2.writeBytes(jpegBytes)
+        tempCnic1.writeBytes(jpegBytes)
+        tempCnic2.writeBytes(jpegBytes)
 
         try {
             val saved = store.registerEmployeesBatch(
@@ -134,13 +139,19 @@ class OfflineAttendanceStoreTest {
                         name = "Ayesha Khan",
                         department = "Diagnostics",
                         photoPath = tempPhoto1.absolutePath,
-                        faceSignature = "0.4200:0.4800:0.6200:0.7400:0.2700:0.7500:0.7100:0.9600"
+                        faceSignature = "0.4200:0.4800:0.6200:0.7400:0.2700:0.7500:0.7100:0.9600",
+                        cnicPhotoPath = tempCnic1.absolutePath,
+                        cnicNumber = "42101-1111111-1",
+                        cnicName = "Ayesha Khan"
                     ),
                     LocalRegistrationInput(
                         name = "Zainab Tariq",
                         department = "Radiology",
                         photoPath = tempPhoto2.absolutePath,
-                        faceSignature = "0.3400:0.3800:0.5100:0.8600:0.1900:0.5900:0.8800:0.9100"
+                        faceSignature = "0.3400:0.3800:0.5100:0.8600:0.1900:0.5900:0.8800:0.9100",
+                        cnicPhotoPath = tempCnic2.absolutePath,
+                        cnicNumber = "42101-2222222-2",
+                        cnicName = "Zainab Tariq"
                     )
                 )
             )
@@ -155,11 +166,69 @@ class OfflineAttendanceStoreTest {
             assertNotNull(zainab)
             assertTrue(ayesha!!.localPhotoPath.isNotBlank())
             assertTrue(java.io.File(ayesha.localPhotoPath).exists())
+            assertTrue(ayesha.cnicPhotoPath.isNotBlank())
+            assertTrue(java.io.File(ayesha.cnicPhotoPath).exists())
+            assertEquals("42101-1111111-1", ayesha.cnicNumber)
             assertTrue(zainab!!.localPhotoPath.isNotBlank())
             assertTrue(java.io.File(zainab.localPhotoPath).exists())
+            assertTrue(zainab.cnicPhotoPath.isNotBlank())
+            assertEquals("42101-2222222-2", zainab.cnicNumber)
         } finally {
             tempPhoto1.delete()
             tempPhoto2.delete()
+            tempCnic1.delete()
+            tempCnic2.delete()
+        }
+    }
+
+    @Test
+    fun getBatchCycleStatus_tracksSingleAndMultiEmployeeDailyCompletion() {
+        val store = OfflineAttendanceStore(context)
+        val photo1 = java.io.File(context.cacheDir, "batch_cycle_1.jpg").apply {
+            writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()))
+        }
+        val photo2 = java.io.File(context.cacheDir, "batch_cycle_2.jpg").apply {
+            writeBytes(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte()))
+        }
+        try {
+            val enrolled = store.registerEmployeesBatch(
+                listOf(
+                    LocalRegistrationInput(
+                        name = "Bilal Ahmed",
+                        photoPath = photo1.absolutePath,
+                        faceSignature = "0.4200:0.4800:0.6200:0.7400:0.2700:0.7500:0.7100:0.9600"
+                    ),
+                    LocalRegistrationInput(
+                        name = "Sara Ali",
+                        photoPath = photo2.absolutePath,
+                        faceSignature = "0.3400:0.3800:0.5100:0.8600:0.1900:0.5900:0.8800:0.9100"
+                    )
+                )
+            )
+            val emp1 = enrolled[0]
+            val emp2 = enrolled[1]
+            val dateKey = "2026-11-18"
+
+            store.recordLocalAttendance(emp1, AttendanceEventType.CHECK_IN, VerificationMethod.FACE_SCAN_1, 95, "09:00:00 AM", dateKey, false)
+            store.recordLocalAttendance(emp1, AttendanceEventType.CHECK_OUT, VerificationMethod.FACE_SCAN_1, 96, "05:00:00 PM", dateKey, false)
+            store.recordLocalAttendance(emp2, AttendanceEventType.CHECK_IN, VerificationMethod.FACE_SCAN_1, 94, "09:05:00 AM", dateKey, false)
+
+            val midStatus = store.getBatchCycleStatus(dateKey)
+            assertTrue(midStatus.isMultiEmployeeMode)
+            assertEquals(2, midStatus.totalEnrolledCount)
+            assertEquals(1, midStatus.completedCount)
+            assertFalse(midStatus.allCompleted)
+            assertEquals(listOf("Sara Ali"), midStatus.incompleteEmployeeNames)
+
+            store.recordLocalAttendance(emp2, AttendanceEventType.CHECK_OUT, VerificationMethod.FACE_SCAN_1, 97, "05:10:00 PM", dateKey, false)
+            val doneStatus = store.getBatchCycleStatus(dateKey)
+            assertTrue(doneStatus.isMultiEmployeeMode)
+            assertEquals(2, doneStatus.completedCount)
+            assertTrue(doneStatus.allCompleted)
+            assertTrue(doneStatus.incompleteEmployeeNames.isEmpty())
+        } finally {
+            photo1.delete()
+            photo2.delete()
         }
     }
 
@@ -184,7 +253,10 @@ class OfflineAttendanceStoreTest {
                 locationAddress = "NICH Campus, Karachi",
                 timeSource = "NTP Verified (time.google.com)",
                 liveSelfiePath = "/tmp/selfie_checkout.jpg",
-                pdfReportPath = ""
+                pdfReportPath = "",
+                isConsolidatedBatch = true,
+                batchDateKey = "2026-11-17",
+                batchEmployeeCount = 2
             )
         )
         store.updatePendingCheckOutPdfPath("log_checkout_locked_1", "/tmp/report_checkout.pdf")
@@ -201,6 +273,8 @@ class OfflineAttendanceStoreTest {
         assertEquals("NTP Verified (time.google.com)", restored.timeSource)
         assertEquals("/tmp/selfie_checkout.jpg", restored.liveSelfiePath)
         assertEquals("/tmp/report_checkout.pdf", restored.pdfReportPath)
+        assertTrue(restored.isConsolidatedBatch)
+        assertEquals(2, restored.batchEmployeeCount)
         assertTrue("log_checkout_locked_1" in restartedStore.pendingEmailLogIds.value)
 
         // Unlock only after confirmation clear

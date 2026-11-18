@@ -28,7 +28,10 @@ data class Employee(
     val isActive: Boolean = true,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null,
-    @get:Exclude val localPhotoPath: String = ""
+    @get:Exclude val localPhotoPath: String = "",
+    val cnicNumber: String = "",
+    val cnicName: String = "",
+    @get:Exclude val cnicPhotoPath: String = ""
 )
 
 data class PasscodeMatchResult(
@@ -53,7 +56,9 @@ data class AttendanceLog(
     val gpsCoordinates: String = "",
     val locationAddress: String = "",
     val timeSource: String = "",
-    @ServerTimestamp val createdAt: Timestamp? = null
+    @ServerTimestamp val createdAt: Timestamp? = null,
+    val matchedCnicName: String = "",
+    val matchedCnicNumber: String = ""
 )
 
 enum class AttendanceEventType(val wireValue: String, val displayLabel: String) {

@@ -217,4 +217,96 @@ class AttendanceLogicTest {
         assertEquals(true, formatted.contains("\u2067محمد انصار\u2069"))
         assertEquals("Muhammad Ansar / محمد انصار - NICH-0147", BidiTextHelper.stripBidiControls(formatted))
     }
+
+    @Test
+    fun cnicOcrParser_extractsNumberAndHolderNameAndRejectsWrongPersonCnic() {
+        val rawCnicText = """
+            PAKISTAN
+            ISLAMIC REPUBLIC OF PAKISTAN
+            NATIONAL IDENTITY CARD
+            Name
+            Bilal Ahmed
+            Father Name
+            Tariq Mahmood
+            Identity Number
+            42101-1234567-1
+            Date of Birth
+            01.01.1995
+        """.trimIndent()
+
+        val parsed = CnicOcrParser.parseFrontOcrText(rawCnicText, insideGreenFrame = true)
+        assertEquals(true, parsed.isCnicCardDetected)
+        assertEquals("42101-1234567-1", parsed.cnicNumber)
+        assertEquals("Bilal Ahmed", parsed.extractedName)
+
+        val bilal = Employee(
+            id = "emp_bilal",
+            name = "Bilal Ahmed",
+            cnicNumber = "42101-1234567-1",
+            cnicName = "Bilal Ahmed"
+        )
+        val matched = CnicOcrParser.verifyAgainstEmployee(
+            CnicScanFrame(
+                cardDetected = true,
+                insideGreenFrame = true,
+                rawOcrText = rawCnicText,
+                extractedName = parsed.extractedName,
+                cnicNumber = parsed.cnicNumber
+            ),
+            bilal
+        )
+        assertEquals(true, matched.matched)
+        assertEquals("42101-1234567-1", matched.matchedCnicNumber)
+
+        val ananya = Employee(
+            id = "emp_ananya",
+            name = "Dr. Ananya Rao",
+            cnicNumber = "42201-7654321-2",
+            cnicName = "Dr. Ananya Rao"
+        )
+        val mismatch = CnicOcrParser.verifyAgainstEmployee(
+            CnicScanFrame(
+                cardDetected = true,
+                insideGreenFrame = true,
+                rawOcrText = rawCnicText,
+                extractedName = parsed.extractedName,
+                cnicNumber = parsed.cnicNumber
+            ),
+            ananya
+        )
+        assertEquals(false, mismatch.matched)
+    }
+
+    @Test
+    fun cnicOcrParser_handlesMixedUrduEnglishNameAndOutsideFrameRejection() {
+        val ansar = Employee(
+            id = "emp_ansar",
+            name = "محمد انصار (Muhammad Ansar)",
+            cnicName = "Muhammad Ansar"
+        )
+        val ocrTypoOutcome = CnicOcrParser.verifyAgainstEmployee(
+            CnicScanFrame(
+                cardDetected = true,
+                insideGreenFrame = true,
+                rawOcrText = "PAKISTAN\nNATIONAL IDENTITY CARD\nName\nMuhamad Ansar\n42101-9876543-1",
+                extractedName = "Muhamad Ansar",
+                cnicNumber = "42101-9876543-1"
+            ),
+            ansar
+        )
+        assertEquals(true, ocrTypoOutcome.matched)
+        assertEquals(true, ocrTypoOutcome.similarityPercent >= CnicOcrParser.NAME_MATCH_THRESHOLD_PERCENT)
+
+        val outsideFrame = CnicOcrParser.verifyAgainstEmployee(
+            CnicScanFrame(
+                cardDetected = true,
+                insideGreenFrame = false,
+                rawOcrText = "Name\nMuhammad Ansar",
+                extractedName = "Muhammad Ansar",
+                cnicNumber = "42101-9876543-1"
+            ),
+            ansar
+        )
+        assertEquals(false, outsideFrame.matched)
+    }
 }

@@ -282,4 +282,87 @@ class AttendanceReportTest {
             runCatching { serverSocket.close() }
         }
     }
+
+    @Test
+    fun generateBatchConsolidatedPdf_createsValidMultiEmployeePdfReport() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val emp1 = Employee(
+            id = "emp_1",
+            employeeCode = "NICH-4001",
+            name = "Bilal Ahmed",
+            department = "Engineering",
+            cnicNumber = "42101-1111111-1"
+        )
+        val emp2 = Employee(
+            id = "emp_2",
+            employeeCode = "NICH-4002",
+            name = "Dr. Ananya Rao",
+            department = "Security",
+            cnicNumber = "42201-2222222-2"
+        )
+        val dateKey = "2026-11-18"
+        val logs = listOf(
+            AttendanceLog(
+                id = "l1",
+                employeeId = emp1.id,
+                employeeCode = emp1.employeeCode,
+                employeeName = emp1.name,
+                eventType = AttendanceEventType.CHECK_IN.wireValue,
+                loggedTimeLabel = "09:00:00 AM",
+                loggedDateKey = dateKey
+            ),
+            AttendanceLog(
+                id = "l2",
+                employeeId = emp1.id,
+                employeeCode = emp1.employeeCode,
+                employeeName = emp1.name,
+                eventType = AttendanceEventType.CHECK_OUT.wireValue,
+                loggedTimeLabel = "05:00:00 PM",
+                loggedDateKey = dateKey
+            ),
+            AttendanceLog(
+                id = "l3",
+                employeeId = emp2.id,
+                employeeCode = emp2.employeeCode,
+                employeeName = emp2.name,
+                eventType = AttendanceEventType.CHECK_IN.wireValue,
+                loggedTimeLabel = "09:30:00 AM",
+                loggedDateKey = dateKey
+            ),
+            AttendanceLog(
+                id = "l4",
+                employeeId = emp2.id,
+                employeeCode = emp2.employeeCode,
+                employeeName = emp2.name,
+                eventType = AttendanceEventType.CHECK_OUT.wireValue,
+                loggedTimeLabel = "05:30:00 PM",
+                loggedDateKey = dateKey
+            )
+        )
+
+        val summary = AttendancePdfGenerator.buildBatchReportSummary(
+            employees = listOf(emp1, emp2),
+            logs = logs,
+            dateKey = dateKey
+        )
+        assertEquals(2, summary.totalCount)
+        assertEquals(2, summary.completedCount)
+        assertEquals("16:00 Hrs", summary.totalTeamDutyHoursLabel)
+
+        val batchPdf = AttendancePdfGenerator.generateBatchConsolidatedPdf(
+            context = context,
+            employees = listOf(emp1, emp2),
+            logs = logs,
+            dateKey = dateKey,
+            recipientEmail = AttendanceEmailReporter.TARGET_RECIPIENT_EMAIL
+        )
+        try {
+            assertTrue(batchPdf.exists())
+            assertTrue(batchPdf.length() > 200L)
+            val header = batchPdf.readBytes().copyOfRange(0, 5).toString(StandardCharsets.US_ASCII)
+            assertEquals("%PDF-", header)
+        } finally {
+            batchPdf.delete()
+        }
+    }
 }

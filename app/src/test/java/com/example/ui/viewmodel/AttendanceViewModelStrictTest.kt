@@ -15,6 +15,7 @@ import com.example.data.local.OfflineAttendanceStore
 import com.example.data.location.LocationAddressProvider
 import com.example.data.location.VerifiedLocationSnapshot
 import com.example.data.model.AttendanceEventType
+import com.example.data.model.CnicScanFrame
 import com.example.data.model.FaceAnalysisFrame
 import com.example.data.model.LivenessDirection
 import com.example.data.model.VerificationMethod
@@ -130,6 +131,24 @@ class AttendanceViewModelStrictTest {
         }
     }
 
+    private fun feedMatchingCnicFrame(
+        viewModel: AttendanceViewModel,
+        employeeName: String,
+        cnicNumber: String = "42101-1234567-1",
+        cnicImagePath: String? = null
+    ) {
+        viewModel.onCnicFrameAnalyzed(
+            CnicScanFrame(
+                cardDetected = true,
+                insideGreenFrame = true,
+                rawOcrText = "PAKISTAN\nNATIONAL IDENTITY CARD\nName\n$employeeName\n$cnicNumber",
+                extractedName = employeeName,
+                cnicNumber = cnicNumber,
+                cnicImagePath = cnicImagePath
+            )
+        )
+    }
+
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
@@ -237,6 +256,13 @@ class AttendanceViewModelStrictTest {
                 signature = vectorEmployeeA,
                 selfiePath = photo.absolutePath
             )
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            feedMatchingCnicFrame(
+                viewModel = viewModel,
+                employeeName = "Bilal Ahmed",
+                cnicNumber = "42101-1234567-1",
+                cnicImagePath = photo.absolutePath
+            )
             runCurrent()
 
             val verified = viewModel.terminalPhase.value
@@ -300,10 +326,16 @@ class AttendanceViewModelStrictTest {
             runCurrent()
             assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.Scanning)
 
-            // Scanning Employee B matches ONLY Dr. Ananya Rao with her photo
+            // Scanning Employee B Step A (Face) + Step B (CNIC) matches ONLY Dr. Ananya Rao
             feedLiveHumanBlinkFrames(
                 viewModel = viewModel,
                 signature = vectorEmployeeB
+            )
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            feedMatchingCnicFrame(
+                viewModel = viewModel,
+                employeeName = "Dr. Ananya Rao",
+                cnicNumber = "42201-7654321-2"
             )
             runCurrent()
 
@@ -315,10 +347,16 @@ class AttendanceViewModelStrictTest {
             viewModel.resetToReady()
             runCurrent()
 
-            // Partial lighting/angle scan (~61%) for Employee A marks Bilal Ahmed seamlessly at >= 50%
+            // Partial lighting/angle scan (~61%) + matching CNIC for Employee A marks Bilal Ahmed
             feedLiveHumanBlinkFrames(
                 viewModel = viewModel,
                 signature = vectorEmployeeAPartial50Plus
+            )
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            feedMatchingCnicFrame(
+                viewModel = viewModel,
+                employeeName = "Bilal Ahmed",
+                cnicNumber = "42101-1234567-1"
             )
             runCurrent()
 
@@ -440,14 +478,25 @@ class AttendanceViewModelStrictTest {
                 signature = vectorEmployeeA,
                 selfiePath = selfieFile.absolutePath
             )
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            feedMatchingCnicFrame(
+                viewModel = viewModel,
+                employeeName = "Bilal Ahmed",
+                cnicNumber = "42101-1234567-1",
+                cnicImagePath = selfieFile.absolutePath
+            )
             runCurrent()
 
             val verified = viewModel.terminalPhase.value as TerminalUiPhase.Verified
             assertEquals(AttendanceEventType.CHECK_OUT, verified.eventType)
 
-            // Wait for automatic Check-Out SMTP/TLS dispatch to finish without requiring an extra click
+            // Wait for automatic Check-Out SMTP/TLS dispatch AND coroutine resumption back to SENT state
             val deadlineMs = System.currentTimeMillis() + 5_000L
-            while (dispatchCount.get() < 1 && System.currentTimeMillis() < deadlineMs) {
+            while (
+                (dispatchCount.get() < 1 ||
+                    (viewModel.terminalPhase.value as? TerminalUiPhase.Verified)?.emailReportStatus != EmailReportStatus.SENT) &&
+                System.currentTimeMillis() < deadlineMs
+            ) {
                 Thread.sleep(25L)
                 runCurrent()
             }
@@ -568,6 +617,13 @@ class AttendanceViewModelStrictTest {
                 signature = vectorEmployeeA,
                 selfiePath = selfieFile.absolutePath
             )
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            feedMatchingCnicFrame(
+                viewModel = viewModel,
+                employeeName = "Bilal Ahmed",
+                cnicNumber = "42101-1234567-1",
+                cnicImagePath = selfieFile.absolutePath
+            )
             runCurrent()
 
             assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.Verified)
@@ -576,14 +632,21 @@ class AttendanceViewModelStrictTest {
             viewModel.sendEmailAndFinish { intent ->
                 launchedIntent = intent
             }
+            runCurrent()
+            val duringCountdown = viewModel.terminalPhase.value as TerminalUiPhase.Verified
+            assertEquals(5, duringCountdown.emailAutoUnlockSecondsRemaining)
 
             val deadlineMs = System.currentTimeMillis() + 5_000L
             while (launchedIntent == null && System.currentTimeMillis() < deadlineMs) {
                 Thread.sleep(25L)
                 runCurrent()
             }
-
             assertNotNull(launchedIntent)
+
+            advanceTimeBy(5_100L)
+            runCurrent()
+
+            assertFalse(store.isCheckOutEmailLocked)
             assertFalse(viewModel.showRegistrationScreen.value)
             assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.Scanning)
         } finally {
@@ -642,14 +705,21 @@ class AttendanceViewModelStrictTest {
             runCurrent()
             assertTrue(spokenLines.any { it.contains("align your face", ignoreCase = true) })
 
-            // Valid Check-Out recognition with live human blink
+            // Valid Check-Out recognition with live human blink + Step B CNIC scan
             feedLiveHumanBlinkFrames(
                 viewModel = viewModel,
                 signature = vectorEmployeeA,
                 selfiePath = selfieFile.absolutePath
             )
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            feedMatchingCnicFrame(
+                viewModel = viewModel,
+                employeeName = "Bilal Ahmed",
+                cnicNumber = "42101-1234567-1",
+                cnicImagePath = selfieFile.absolutePath
+            )
             runCurrent()
-            assertTrue(spokenLines.any { it.contains("Check-out verified for Bilal Ahmed", ignoreCase = true) })
+            assertTrue(spokenLines.any { it.contains("Check-out confirmed for Bilal Ahmed", ignoreCase = true) })
 
             // Trying to skip / close / reset before sending email MUST be blocked
             viewModel.attemptSkipOrDismissCheckOut()
@@ -669,15 +739,18 @@ class AttendanceViewModelStrictTest {
                 spokenLines.count { it == VoicePromptScript.MANDATORY_EMAIL_ENFORCEMENT_PROMPT } >= 2
             )
 
-            // Sending email completes Check-Out and unlocks return to scanner
+            // Sending email starts 5-second countdown, launches intent, and unlocks return to scanner
             var intentLaunched = false
             viewModel.sendEmailAndFinish { intentLaunched = true }
+            runCurrent()
             val deadlineMs = System.currentTimeMillis() + 5_000L
             while (!intentLaunched && System.currentTimeMillis() < deadlineMs) {
                 Thread.sleep(25L)
                 runCurrent()
             }
             assertTrue(intentLaunched)
+            advanceTimeBy(5_100L)
+            runCurrent()
             assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.Scanning)
         } finally {
             selfieFile.delete()
@@ -916,6 +989,13 @@ class AttendanceViewModelStrictTest {
             runCurrent()
 
             feedLiveHumanBlinkFrames(viewModel, vectorEmployeeA, selfieFile.absolutePath)
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            feedMatchingCnicFrame(
+                viewModel = viewModel,
+                employeeName = "Bilal Ahmed",
+                cnicNumber = "42101-1234567-1",
+                cnicImagePath = selfieFile.absolutePath
+            )
             runCurrent()
 
             val verified = viewModel.terminalPhase.value as TerminalUiPhase.Verified
@@ -1164,6 +1244,13 @@ class AttendanceViewModelStrictTest {
             vm1.onCameraInitialized()
             runCurrent()
             feedLiveHumanBlinkFrames(vm1, vectorEmployeeA, selfieFile.absolutePath)
+            assertTrue(vm1.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            feedMatchingCnicFrame(
+                viewModel = vm1,
+                employeeName = "Bilal Ahmed",
+                cnicNumber = "42101-1234567-1",
+                cnicImagePath = selfieFile.absolutePath
+            )
             runCurrent()
 
             val lockDeadline = System.currentTimeMillis() + 5_000L
@@ -1217,7 +1304,7 @@ class AttendanceViewModelStrictTest {
                 assertTrue(lockedPhase.emailEnforcementWarningActive)
                 assertEquals(VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT, lockedPhase.emailEnforcementMessage)
 
-                // 3. Attempting new Check-In scan/frames MUST be blocked & speak recurring lock prompt
+                // 3. Attempting new Check-In scan/frames BEFORE tapping Send Email MUST be blocked & speak lock prompt
                 vmAfterRestart.startVipBiometricScan(listOf(LivenessDirection.CENTER_VERIFY))
                 feedLiveHumanBlinkFrames(vmAfterRestart, vectorEmployeeA, selfieFile.absolutePath)
                 vmAfterRestart.openRegistrationScreen()
@@ -1229,27 +1316,21 @@ class AttendanceViewModelStrictTest {
                 assertEquals(1, storeAfterKill.logs.value.size)
                 assertTrue(spokenLines.any { it == VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT })
 
-                // 4. Even tapping Send Email while still offline MUST keep lock active (no Gmail fallback bypass!)
-                vmAfterRestart.sendEmailAndFinish { }
-                val failedRetryDeadline = System.currentTimeMillis() + 5_000L
-                while (
-                    (vmAfterRestart.terminalPhase.value as? TerminalUiPhase.Verified)?.emailReportStatus == EmailReportStatus.DISPATCHING &&
-                    System.currentTimeMillis() < failedRetryDeadline
-                ) {
-                    Thread.sleep(20L)
-                    runCurrent()
-                }
-                assertTrue(storeAfterKill.isCheckOutEmailLocked)
-                assertTrue(vmAfterRestart.terminalPhase.value is TerminalUiPhase.Verified)
-
-                // 5. Restore network -> SMTP succeeds -> DB unlocks and new Check-In works!
+                // 4. Restore network & tap Send Email -> SMTP dispatches & 5-second countdown clears lock cleanly
                 smtpNetworkReachable.set(true)
                 vmAfterRestart.sendEmailAndFinish { }
-                val unlockDeadline = System.currentTimeMillis() + 5_000L
-                while (storeAfterKill.isCheckOutEmailLocked && System.currentTimeMillis() < unlockDeadline) {
+                runCurrent()
+                assertEquals(
+                    5,
+                    (vmAfterRestart.terminalPhase.value as? TerminalUiPhase.Verified)?.emailAutoUnlockSecondsRemaining
+                )
+
+                val smtpDeadline = System.currentTimeMillis() + 5_000L
+                while (receivedPayloads.isEmpty() && System.currentTimeMillis() < smtpDeadline) {
                     Thread.sleep(25L)
                     runCurrent()
                 }
+                advanceTimeBy(5_100L)
                 runCurrent()
 
                 assertFalse(storeAfterKill.isCheckOutEmailLocked)
@@ -1302,5 +1383,322 @@ class AttendanceViewModelStrictTest {
         composeRule.onNodeWithText(VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT).assertIsDisplayed()
         composeRule.onNodeWithTag("offline_lock_saved_badge").assertIsDisplayed()
         composeRule.onNodeWithTag("send_checkout_email_button").assertIsDisplayed()
+    }
+
+    @Test
+    fun dualVerification_rejectsWrongEmployeeCnicAndSpeaksVoiceAlert() = runTest(testDispatcher) {
+        val spokenLines = mutableListOf<String>()
+        val spySpeaker = object : VoiceSpeaker {
+            override fun speak(message: String, flush: Boolean) {
+                spokenLines += message
+            }
+            override fun shutdown() = Unit
+        }
+        val store = OfflineAttendanceStore(context)
+        val photo = createTempPortrait("cnic_reject.jpg")
+        try {
+            store.registerEmployeesBatch(
+                listOf(
+                    LocalRegistrationInput(
+                        name = "Bilal Ahmed",
+                        department = "Engineering",
+                        photoPath = photo.absolutePath,
+                        faceSignature = vectorEmployeeA,
+                        cnicPhotoPath = photo.absolutePath,
+                        cnicNumber = "42101-1234567-1",
+                        cnicName = "Bilal Ahmed"
+                    )
+                )
+            )
+            val viewModel = AttendanceViewModel(
+                offlineStore = store,
+                autoInitBackgroundJobs = false,
+                calendarProvider = { morningCheckInCalendar() },
+                voiceSpeaker = spySpeaker
+            )
+            runCurrent()
+            viewModel.startVipBiometricScan()
+            viewModel.onCameraInitialized()
+            runCurrent()
+
+            feedLiveHumanBlinkFrames(viewModel, vectorEmployeeA, photo.absolutePath)
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+
+            // Scan wrong person's CNIC -> MUST reject Step B cleanly and keep attendance unrecorded
+            feedMatchingCnicFrame(
+                viewModel = viewModel,
+                employeeName = "Random Stranger",
+                cnicNumber = "42201-9999999-9",
+                cnicImagePath = photo.absolutePath
+            )
+            runCurrent()
+
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+            assertTrue(store.logs.value.isEmpty())
+            assertTrue(spokenLines.any { it.contains("CNIC name does not match Bilal Ahmed", ignoreCase = true) })
+        } finally {
+            photo.delete()
+        }
+    }
+
+    @Test
+    fun multiEmployeeBatchMode_gatesSendEmailUntilAllStaffCompleteCheckInAndCheckOut_thenDispatchesConsolidatedPdf() = runTest(testDispatcher) {
+        val sentPayloads = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val serverSocket = ServerSocket(0, 4, InetAddress.getByName("127.0.0.1"))
+        val serverThread = Thread {
+            try {
+                while (!serverSocket.isClosed) {
+                    val client = serverSocket.accept()
+                    val reader = BufferedReader(InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8))
+                    val writer = OutputStreamWriter(client.getOutputStream(), StandardCharsets.US_ASCII)
+                    fun reply(msg: String) {
+                        writer.write("$msg\r\n")
+                        writer.flush()
+                    }
+                    reply("220 localhost ESMTP ready")
+                    var inData = false
+                    var sentAuthUser = false
+                    val payloadBuilder = StringBuilder()
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (inData) {
+                            if (line == ".") {
+                                inData = false
+                                sentPayloads.add(payloadBuilder.toString())
+                                payloadBuilder.setLength(0)
+                                reply("250 2.0.0 OK queued")
+                            } else {
+                                payloadBuilder.append(line).append('\n')
+                            }
+                        } else {
+                            when {
+                                line.startsWith("EHLO") -> reply("250-localhost\r\n250 AUTH LOGIN")
+                                line == "AUTH LOGIN" -> reply("334 VXNlcm5hbWU6")
+                                !sentAuthUser && line != "AUTH LOGIN" -> {
+                                    sentAuthUser = true
+                                    reply("334 UGFzc3dvcmQ6")
+                                }
+                                line.startsWith("MAIL FROM:") -> reply("250 2.1.0 OK")
+                                line.startsWith("RCPT TO:") -> reply("250 2.1.5 OK")
+                                line == "DATA" -> {
+                                    reply("354 End data with <CR><LF>.<CR><LF>")
+                                    inData = true
+                                }
+                                line == "QUIT" -> {
+                                    reply("221 Bye")
+                                    break
+                                }
+                                else -> reply("235 2.7.0 OK")
+                            }
+                        }
+                    }
+                    client.close()
+                }
+            } catch (_: Exception) {
+            }
+        }
+        serverThread.isDaemon = true
+        serverThread.start()
+
+        val photoA = createTempPortrait("batch_a.jpg")
+        val photoB = createTempPortrait("batch_b.jpg")
+        val currentClock = Calendar.getInstance().apply {
+            clear()
+            set(2026, Calendar.NOVEMBER, 18, 9, 0, 0)
+        }
+        try {
+            val smtpSender = SmtpEmailSender { _ -> Socket("127.0.0.1", serverSocket.localPort) }
+            val reporter = AttendanceEmailReporter(
+                context = context,
+                smtpSender = smtpSender,
+                senderEmailProvider = { "Nichemployeeattendance@gmail.com" },
+                appPasswordProvider = { "abcd efgh ijkl mnop" }
+            )
+            val store = OfflineAttendanceStore(context)
+            store.registerEmployeesBatch(
+                listOf(
+                    LocalRegistrationInput(
+                        name = "Bilal Ahmed",
+                        department = "Engineering",
+                        photoPath = photoA.absolutePath,
+                        faceSignature = vectorEmployeeA,
+                        cnicPhotoPath = photoA.absolutePath,
+                        cnicNumber = "42101-1111111-1",
+                        cnicName = "Bilal Ahmed"
+                    ),
+                    LocalRegistrationInput(
+                        name = "Dr. Ananya Rao",
+                        department = "Security",
+                        photoPath = photoB.absolutePath,
+                        faceSignature = vectorEmployeeB,
+                        cnicPhotoPath = photoB.absolutePath,
+                        cnicNumber = "42201-2222222-2",
+                        cnicName = "Dr. Ananya Rao"
+                    )
+                )
+            )
+            val viewModel = AttendanceViewModel(
+                offlineStore = store,
+                emailReporter = reporter,
+                autoInitBackgroundJobs = false,
+                calendarProvider = { currentClock.clone() as Calendar },
+                continuousKioskMode = true,
+                sameEmployeeCooldownMs = 0L
+            )
+            runCurrent()
+
+            fun performScan(sig: String, name: String, cnic: String, imgPath: String) {
+                viewModel.startVipBiometricScan()
+                viewModel.onCameraInitialized()
+                runCurrent()
+                feedLiveHumanBlinkFrames(viewModel, sig, imgPath)
+                assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+                feedMatchingCnicFrame(viewModel, name, cnic, imgPath)
+                runCurrent()
+            }
+
+            // Morning 09:00 AM Check-In for both staff
+            performScan(vectorEmployeeA, "Bilal Ahmed", "42101-1111111-1", photoA.absolutePath)
+            assertEquals(AttendanceEventType.CHECK_IN, (viewModel.terminalPhase.value as TerminalUiPhase.Verified).eventType)
+            advanceTimeBy(2_600L); runCurrent()
+
+            performScan(vectorEmployeeB, "Dr. Ananya Rao", "42201-2222222-2", photoB.absolutePath)
+            assertEquals(AttendanceEventType.CHECK_IN, (viewModel.terminalPhase.value as TerminalUiPhase.Verified).eventType)
+            advanceTimeBy(2_600L); runCurrent()
+            assertEquals(0, sentPayloads.size)
+
+            // Evening 05:30 PM Check-Out #1 (Bilal only): Email MUST stay gated/disabled & NO lock blocks Employee #2!
+            currentClock.set(Calendar.HOUR_OF_DAY, 17)
+            currentClock.set(Calendar.MINUTE, 30)
+            performScan(vectorEmployeeA, "Bilal Ahmed", "42101-1111111-1", photoA.absolutePath)
+            val midOut = viewModel.terminalPhase.value as TerminalUiPhase.Verified
+            assertTrue(midOut.isBatchMode)
+            assertEquals(1, midOut.batchCompletedCount)
+            assertEquals(2, midOut.batchTotalCount)
+            assertFalse(midOut.batchAllCompleted)
+            assertEquals(listOf("Dr. Ananya Rao"), midOut.batchPendingEmployeeNames)
+            assertFalse(store.isCheckOutEmailLocked)
+            // Attempting Send Email while batch incomplete is a no-op
+            viewModel.sendEmailAndFinish { }
+            runCurrent()
+            assertEquals(0, sentPayloads.size)
+
+            // Returns automatically to scanner for Employee #2
+            advanceTimeBy(2_600L); runCurrent()
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.Scanning)
+
+            // Evening Check-Out #2 (Ananya finishes): Consolidated Batch PDF enabled & auto-sent!
+            performScan(vectorEmployeeB, "Dr. Ananya Rao", "42201-2222222-2", photoB.absolutePath)
+            val finalOut = viewModel.terminalPhase.value as TerminalUiPhase.Verified
+            assertTrue(finalOut.isBatchMode)
+            assertEquals(2, finalOut.batchCompletedCount)
+            assertEquals(2, finalOut.batchTotalCount)
+            assertTrue(finalOut.batchAllCompleted)
+            assertTrue(store.isCheckOutEmailLocked)
+
+            val smtpDeadline = System.currentTimeMillis() + 5_000L
+            while (
+                (sentPayloads.isEmpty() ||
+                    (viewModel.terminalPhase.value as? TerminalUiPhase.Verified)?.emailReportStatus != EmailReportStatus.SENT) &&
+                System.currentTimeMillis() < smtpDeadline
+            ) {
+                Thread.sleep(25L)
+                runCurrent()
+            }
+            assertEquals(1, sentPayloads.size)
+            val mime = sentPayloads.single()
+            assertTrue(mime.contains("Content-Type: application/pdf;"))
+            assertTrue(mime.contains("Content-Type: image/jpeg;"))
+            val rawSubject = mime.lines().firstOrNull { it.startsWith("Subject:") }.orEmpty()
+            val decodedSubject = if (rawSubject.contains("=?UTF-8?B?")) {
+                val b64 = rawSubject.substringAfter("=?UTF-8?B?").substringBefore("?=")
+                String(android.util.Base64.decode(b64, android.util.Base64.DEFAULT), StandardCharsets.UTF_8)
+            } else {
+                rawSubject
+            }
+            assertTrue(decodedSubject.contains("CONSOLIDATED BATCH REPORT"))
+
+            val textPartMarker = "Content-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: base64\n\n"
+            val startIdx = mime.indexOf(textPartMarker)
+            assertTrue(startIdx >= 0)
+            val encodedTextBody = mime.substring(startIdx + textPartMarker.length).substringBefore("\n--====NICH_ATT_")
+            val decodedEmailBody = String(
+                android.util.Base64.decode(encodedTextBody, android.util.Base64.DEFAULT),
+                StandardCharsets.UTF_8
+            )
+            assertTrue(decodedEmailBody.contains("Consolidated Multi-Employee Daily Report"))
+            assertTrue(decodedEmailBody.contains("Completed Staff Cycles: 2/2"))
+            assertTrue(decodedEmailBody.contains("Bilal Ahmed"))
+            assertTrue(decodedEmailBody.contains("Dr. Ananya Rao"))
+            assertFalse(store.isCheckOutEmailLocked)
+        } finally {
+            runCatching { serverSocket.close() }
+            photoA.delete()
+            photoB.delete()
+        }
+    }
+
+    @Test
+    fun pendingCheckOutLock_fiveSecondCountdownOnSendEmailAutoClearsLockEvenWithoutSmtp() = runTest(testDispatcher) {
+        val reporter = AttendanceEmailReporter(
+            context = context,
+            appPasswordProvider = { "MY_GMAIL_APP_PASSWORD" }
+        )
+        val store = OfflineAttendanceStore(context)
+        val photo = createTempPortrait("countdown_unlock.jpg")
+        try {
+            store.registerEmployeesBatch(
+                listOf(
+                    LocalRegistrationInput(
+                        name = "Bilal Ahmed",
+                        department = "Engineering",
+                        photoPath = photo.absolutePath,
+                        faceSignature = vectorEmployeeA,
+                        cnicPhotoPath = photo.absolutePath,
+                        cnicNumber = "42101-1234567-1",
+                        cnicName = "Bilal Ahmed"
+                    )
+                )
+            )
+            val viewModel = AttendanceViewModel(
+                offlineStore = store,
+                emailReporter = reporter,
+                autoInitBackgroundJobs = false,
+                calendarProvider = { afternoonCheckOutCalendar() }
+            )
+            runCurrent()
+            viewModel.startVipBiometricScan()
+            viewModel.onCameraInitialized()
+            runCurrent()
+
+            feedLiveHumanBlinkFrames(viewModel, vectorEmployeeA, photo.absolutePath)
+            feedMatchingCnicFrame(viewModel, "Bilal Ahmed", "42101-1234567-1", photo.absolutePath)
+            runCurrent()
+
+            assertTrue(store.isCheckOutEmailLocked)
+
+            // Tapping Send Email launches intent AND starts 5-second countdown
+            viewModel.sendEmailAndFinish { }
+            runCurrent()
+            val tick5 = viewModel.terminalPhase.value as TerminalUiPhase.Verified
+            assertEquals(5, tick5.emailAutoUnlockSecondsRemaining)
+            assertTrue(store.isCheckOutEmailLocked)
+
+            advanceTimeBy(3_000L)
+            runCurrent()
+            val tick2 = viewModel.terminalPhase.value as TerminalUiPhase.Verified
+            assertEquals(2, tick2.emailAutoUnlockSecondsRemaining)
+            assertTrue(store.isCheckOutEmailLocked)
+
+            advanceTimeBy(2_100L)
+            runCurrent()
+
+            // After 5 seconds total: pending email lock is cleared & terminal returns to Scanning
+            assertFalse(store.isCheckOutEmailLocked)
+            assertNull(store.pendingCheckOutLock.value)
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.Scanning)
+        } finally {
+            photo.delete()
+        }
     }
 }

@@ -59,12 +59,15 @@ import androidx.compose.ui.unit.dp
 import com.example.BuildConfig
 import com.example.R
 import com.example.data.model.AttendanceEventType
+import com.example.data.model.CnicScanFrame
 import com.example.data.model.FaceAnalysisFrame
 import com.example.data.model.LivenessDirection
 import com.example.data.report.AttendanceEmailReporter
 import com.example.data.report.EmailReportStatus
 import com.example.ui.components.BiometricCameraScanner
+import com.example.ui.components.BiometricScannerMode
 import com.example.ui.components.EmployeeAvatar
+import com.example.ui.theme.NeonAmber
 import com.example.ui.theme.NeonCyan
 import com.example.ui.theme.NeonGreen
 import com.example.ui.theme.NeonRed
@@ -87,7 +90,9 @@ fun TerminalDashboardScreen(
     onResetTerminal: () -> Unit,
     onAttemptSkipCheckOutEmail: () -> Unit = {},
     networkTimeLabel: String = "NTP Network Time",
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onCnicFrameAnalyzed: (CnicScanFrame) -> Unit = {},
+    onCancelCnicScan: () -> Unit = {}
 ) {
     LaunchedEffect(terminalPhase) {
         if (terminalPhase is TerminalUiPhase.Ready) {
@@ -97,6 +102,8 @@ fun TerminalDashboardScreen(
 
     if (terminalPhase is TerminalUiPhase.Failure) {
         BackHandler { onResetTerminal() }
+    } else if (terminalPhase is TerminalUiPhase.CnicScanning) {
+        BackHandler { onCancelCnicScan() }
     } else if (terminalPhase is TerminalUiPhase.Verified &&
         terminalPhase.eventType == AttendanceEventType.CHECK_OUT
     ) {
@@ -112,6 +119,13 @@ fun TerminalDashboardScreen(
     val activeSteps = (terminalPhase as? TerminalUiPhase.Scanning)?.livenessSteps
         ?: listOf(LivenessDirection.CENTER_VERIFY)
     val activeStepIndex = (terminalPhase as? TerminalUiPhase.Scanning)?.currentLivenessStepIndex ?: 0
+    val cnicPhase = terminalPhase as? TerminalUiPhase.CnicScanning
+    val scannerMode = if (cnicPhase != null) {
+        BiometricScannerMode.REAR_CNIC_SCAN
+    } else {
+        BiometricScannerMode.FRONT_FACE_LIVENESS
+    }
+    val cnicAligned = cnicPhase?.let { it.cardDetected && it.insideGreenFrame } ?: false
 
     Box(
         modifier = modifier
@@ -125,13 +139,16 @@ fun TerminalDashboardScreen(
             onCameraInitialized = onCameraInitialized,
             onCameraInitFailed = onCameraInitFailed,
             onFrameAnalyzed = onFrameAnalyzed,
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
+            scannerMode = scannerMode,
+            cnicAligned = cnicAligned,
+            onCnicFrameAnalyzed = onCnicFrameAnalyzed
         )
 
-        // Subtle live AI voice, anti-spoofing liveness & NTP time lock pill at the top center
+        // Subtle live AI voice, anti-spoofing liveness, Step-B CNIC guidance & NTP time lock pill at the top center
         val scanningPhase = terminalPhase as? TerminalUiPhase.Scanning
-        val qualityHint = scanningPhase?.qualityHint
         if (scanningPhase != null) {
+            val qualityHint = scanningPhase.qualityHint
             val pillText = qualityHint?.takeIf { it.isNotBlank() }
                 ?: if (scanningPhase.livenessVerified) {
                     "Liveness Verified • $networkTimeLabel"
@@ -194,6 +211,70 @@ fun TerminalDashboardScreen(
                         textAlign = TextAlign.Center,
                         modifier = Modifier.testTag("app_version_badge")
                     )
+                }
+            }
+        } else if (cnicPhase != null) {
+            val cnicBorder = if (cnicPhase.cardDetected && cnicPhase.insideGreenFrame) {
+                NeonGreen.copy(alpha = 0.85f)
+            } else {
+                NeonCyan.copy(alpha = 0.65f)
+            }
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = ObsidianSurface.copy(alpha = 0.90f),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .safeDrawingPadding()
+                    .padding(top = 18.dp, start = 24.dp, end = 24.dp)
+                    .border(1.5.dp, cnicBorder, RoundedCornerShape(14.dp))
+                    .testTag("cnic_step_guidance_pill")
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Text(
+                        text = "Step A Face Verified: ${cnicPhase.employee.name} (${cnicPhase.faceConfidenceScore}%)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = NeonGreen,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = cnicPhase.qualityHint?.takeIf { it.isNotBlank() }
+                            ?: stringResource(R.string.cnic_green_frame_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextPrimary,
+                        textAlign = TextAlign.Center
+                    )
+                    if (cnicPhase.detectedCnicName.isNotBlank() || cnicPhase.detectedCnicNumber.isNotBlank()) {
+                        Text(
+                            text = listOf(cnicPhase.detectedCnicName, cnicPhase.detectedCnicNumber)
+                                .filter { it.isNotBlank() }
+                                .joinToString(" • "),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = NeonCyan,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                    Button(
+                        onClick = onCancelCnicScan,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ObsidianElevated,
+                            contentColor = TextPrimary
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("cancel_cnic_scan_button")
+                    ) {
+                        Text(
+                            text = "Re-scan Face",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                 }
             }
         }
@@ -421,7 +502,12 @@ private fun VerificationSuccessOverlay(
                     textAlign = TextAlign.Center
                 )
 
-                if (phase.gpsCoordinates.isNotBlank() || phase.locationAddress.isNotBlank() || phase.timeSourceLabel.isNotBlank()) {
+                if (phase.gpsCoordinates.isNotBlank() ||
+                    phase.locationAddress.isNotBlank() ||
+                    phase.timeSourceLabel.isNotBlank() ||
+                    phase.matchedCnicNumber.isNotBlank() ||
+                    phase.matchedCnicName.isNotBlank()
+                ) {
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = ObsidianElevated,
@@ -436,6 +522,18 @@ private fun VerificationSuccessOverlay(
                                 .padding(horizontal = 12.dp, vertical = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
+                            if (phase.matchedCnicNumber.isNotBlank() || phase.matchedCnicName.isNotBlank()) {
+                                val cnicLabel = listOf(phase.matchedCnicName, phase.matchedCnicNumber)
+                                    .filter { it.isNotBlank() }
+                                    .joinToString(" • ")
+                                Text(
+                                    text = "CNIC Verified: $cnicLabel",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = NeonGreen,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.testTag("verified_cnic_badge")
+                                )
+                            }
                             if (phase.gpsCoordinates.isNotBlank()) {
                                 Text(
                                     text = "GPS: ${phase.gpsCoordinates}",
@@ -463,14 +561,77 @@ private fun VerificationSuccessOverlay(
                     }
                 }
 
+                if (phase.isBatchMode) {
+                    val batchColor = if (phase.batchAllCompleted) NeonGreen else NeonAmber
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = batchColor.copy(alpha = 0.12f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, batchColor.copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+                            .testTag("batch_progress_summary_card")
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Text(
+                                text = "Team Batch Cycle: ${phase.batchCompletedCount}/${phase.batchTotalCount} Completed",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = batchColor,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = if (phase.batchAllCompleted) {
+                                    "All registered staff finished Check-In & Check-Out. Consolidated Batch PDF ready."
+                                } else {
+                                    val pendingText = phase.batchPendingEmployeeNames.joinToString(", ")
+                                    if (pendingText.isNotBlank()) {
+                                        "Waiting for: $pendingText. ${stringResource(R.string.batch_waiting_others_hint)}"
+                                    } else {
+                                        stringResource(R.string.batch_waiting_others_hint)
+                                    }
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextPrimary
+                            )
+                        }
+                    }
+                }
+
                 // Conditional Email Notification + Mandatory Blocking Enforcement: shown & triggered ONLY on Check-Out
                 if (phase.eventType == AttendanceEventType.CHECK_OUT) {
                     val isSending = phase.emailReportStatus == EmailReportStatus.DISPATCHING
                     val isSent = phase.emailReportStatus == EmailReportStatus.SENT
+                    val countdownSec = phase.emailAutoUnlockSecondsRemaining
+                    val batchReadyToSend = !phase.isBatchMode || phase.batchAllCompleted
                     val showBlockingBanner = (phase.emailEnforcementWarningActive || phase.isPersistentLock) &&
-                        !phase.isCheckOutEmailCompleted
+                        !phase.isCheckOutEmailCompleted &&
+                        countdownSec == null
 
-                    if (showBlockingBanner) {
+                    if (countdownSec != null) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = NeonCyan.copy(alpha = 0.14f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(1.5.dp, NeonCyan, RoundedCornerShape(12.dp))
+                                .testTag("pending_email_unlock_countdown")
+                        ) {
+                            Text(
+                                text = "Email triggered • Auto-clearing lock & unlocking scanner in ${countdownSec}s...",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = NeonCyan,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                            )
+                        }
+                    } else if (showBlockingBanner) {
                         Surface(
                             shape = RoundedCornerShape(14.dp),
                             color = NeonRed.copy(alpha = 0.16f),
@@ -530,12 +691,12 @@ private fun VerificationSuccessOverlay(
 
                     Button(
                         onClick = onSendCheckOutEmail,
-                        enabled = !isSending,
+                        enabled = !isSending && countdownSec == null && batchReadyToSend,
                         shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = NeonGreen,
                             contentColor = ObsidianVoid,
-                            disabledContainerColor = NeonGreen.copy(alpha = 0.5f),
+                            disabledContainerColor = NeonGreen.copy(alpha = 0.35f),
                             disabledContentColor = ObsidianVoid.copy(alpha = 0.7f)
                         ),
                         modifier = Modifier
@@ -552,8 +713,11 @@ private fun VerificationSuccessOverlay(
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = when {
+                                countdownSec != null -> "Unlocking in ${countdownSec}s..."
+                                !batchReadyToSend -> "Batch Waiting (${phase.batchCompletedCount}/${phase.batchTotalCount})"
                                 isSent -> "Email Sent • Finish"
                                 isSending -> stringResource(R.string.dispatching_email_and_finishing)
+                                phase.isBatchMode -> stringResource(R.string.send_batch_email_and_finish)
                                 phase.isPersistentLock -> stringResource(R.string.retry_send_checkout_email)
                                 else -> stringResource(R.string.send_email_and_finish)
                             },

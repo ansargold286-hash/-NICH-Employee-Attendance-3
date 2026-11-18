@@ -14,6 +14,8 @@ import com.example.data.model.AntiSpoofingLivenessTracker
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
 import com.example.data.model.AttendanceTimeRules
+import com.example.data.model.CnicOcrParser
+import com.example.data.model.CnicScanFrame
 import com.example.data.model.Employee
 import com.example.data.model.FaceAnalysisFrame
 import com.example.data.model.FaceBiometricMatcher
@@ -69,6 +71,20 @@ sealed interface TerminalUiPhase {
         val qualityHint: String? = null
     ) : TerminalUiPhase
 
+    data class CnicScanning(
+        val employee: Employee,
+        val faceConfidenceScore: Int,
+        val verificationMethod: VerificationMethod,
+        val liveSelfiePath: String? = null,
+        val cameraReady: Boolean = false,
+        val cardDetected: Boolean = false,
+        val insideGreenFrame: Boolean = false,
+        val detectedCnicName: String = "",
+        val detectedCnicNumber: String = "",
+        val statusHeadline: String = "STEP B • HOLD CNIC FRONT INSIDE GREEN FRAME",
+        val qualityHint: String? = null
+    ) : TerminalUiPhase
+
     data class Verified(
         val employee: Employee,
         val eventType: AttendanceEventType,
@@ -87,10 +103,21 @@ sealed interface TerminalUiPhase {
         val emailReportStatus: EmailReportStatus = EmailReportStatus.NEEDS_CONFIG,
         val emailEnforcementWarningActive: Boolean = false,
         val emailEnforcementMessage: String? = null,
-        val checkOutEmailTriggeredOrSent: Boolean = false
+        val checkOutEmailTriggeredOrSent: Boolean = false,
+        val matchedCnicName: String = "",
+        val matchedCnicNumber: String = "",
+        val cnicPhotoPath: String? = null,
+        val isBatchMode: Boolean = false,
+        val batchCompletedCount: Int = 1,
+        val batchTotalCount: Int = 1,
+        val batchAllCompleted: Boolean = true,
+        val batchPendingEmployeeNames: List<String> = emptyList(),
+        val batchDateKey: String = "",
+        val emailAutoUnlockSecondsRemaining: Int? = null
     ) : TerminalUiPhase {
         val isCheckOutEmailCompleted: Boolean
             get() = eventType != AttendanceEventType.CHECK_OUT ||
+                (isBatchMode && !batchAllCompleted) ||
                 checkOutEmailTriggeredOrSent ||
                 emailReportStatus == EmailReportStatus.SENT
     }
@@ -199,7 +226,10 @@ class AttendanceViewModel(
     private var resetTimerJob: Job? = null
     private var emailDispatchJob: Job? = null
     private var emailReminderJob: Job? = null
+    private var emailCountdownJob: Job? = null
+    private var pdfPreGenJob: Job? = null
     private var scanMatchInFlight = false
+    private var cnicCommitInFlight = false
     private var consecutiveMatchCount = 0
     private var livenessHoldCount = 0
     private var lastMatchedEmployeeId: String? = null
@@ -270,9 +300,11 @@ class AttendanceViewModel(
         triggerVoice: Boolean,
         throttleVoice: Boolean = false
     ) {
+        if (emailCountdownJob?.isActive == true) return
         scanTimerJob?.cancel()
         resetTimerJob?.cancel()
         scanMatchInFlight = false
+        cnicCommitInFlight = false
         _showRegistrationScreen.value = false
 
         val matchedEmployee = offlineStore.employees.value.firstOrNull { it.id == lock.employeeId }
@@ -292,6 +324,9 @@ class AttendanceViewModel(
             EmailReportStatus.NEEDS_CONFIG
         }
 
+        val batchCount = lock.batchEmployeeCount.coerceAtLeast(1)
+        val batchDate = lock.batchDateKey.ifBlank { lock.loggedDateKey }
+
         _terminalPhase.value = TerminalUiPhase.Verified(
             employee = matchedEmployee,
             eventType = AttendanceEventType.CHECK_OUT,
@@ -310,7 +345,16 @@ class AttendanceViewModel(
             emailReportStatus = currentStatus,
             emailEnforcementWarningActive = true,
             emailEnforcementMessage = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT,
-            checkOutEmailTriggeredOrSent = false
+            checkOutEmailTriggeredOrSent = false,
+            matchedCnicName = matchedEmployee.cnicName.ifBlank { matchedEmployee.name },
+            matchedCnicNumber = matchedEmployee.cnicNumber,
+            cnicPhotoPath = matchedEmployee.cnicPhotoPath.ifBlank { null },
+            isBatchMode = lock.isConsolidatedBatch,
+            batchCompletedCount = batchCount,
+            batchTotalCount = batchCount,
+            batchAllCompleted = true,
+            batchPendingEmployeeNames = emptyList(),
+            batchDateKey = batchDate
         )
 
         if (triggerVoice) {
@@ -464,23 +508,46 @@ class AttendanceViewModel(
                 roleTitle = "Authorized Staff",
                 avatarKey = log.avatarKey
             )
-            val outcome = reporter.generateAndSendReport(
-                employee = employee,
-                log = log,
-                eventType = AttendanceEventType.fromWire(log.eventType),
-                verificationMethod = VerificationMethod.fromWire(log.verificationMethod),
-                confidenceScore = log.confidenceScore.toInt(),
-                syncedToCloud = log.id !in pendingCloudIds,
-                recentDailyLogs = recentLogs,
-                liveSelfiePath = selfieMap[log.id]
-            )
+            val activeLock = offlineStore.pendingCheckOutLock.value
+            val isBatchRetry = activeLock?.logId == logId && activeLock.isConsolidatedBatch
+            val targetDateKey = activeLock?.batchDateKey?.ifBlank { log.loggedDateKey } ?: log.loggedDateKey
+            val outcome = if (isBatchRetry) {
+                val batchEmployees = offlineStore.getRegisteredBiometricEmployees()
+                    .ifEmpty { offlineStore.employees.value }
+                val dateLogs = recentLogs.filter { it.loggedDateKey == targetDateKey }
+                reporter.generateAndSendBatchReport(
+                    employees = batchEmployees,
+                    logs = dateLogs,
+                    dateKey = targetDateKey,
+                    selfiePathsByLogId = selfieMap,
+                    syncedToCloud = log.id !in pendingCloudIds
+                )
+            } else {
+                reporter.generateAndSendReport(
+                    employee = employee,
+                    log = log,
+                    eventType = AttendanceEventType.fromWire(log.eventType),
+                    verificationMethod = VerificationMethod.fromWire(log.verificationMethod),
+                    confidenceScore = log.confidenceScore.toInt(),
+                    syncedToCloud = log.id !in pendingCloudIds,
+                    recentDailyLogs = recentLogs,
+                    liveSelfiePath = selfieMap[log.id]
+                )
+            }
             if (outcome == EmailReportStatus.SENT) {
                 offlineStore.clearPendingCheckOutLock(logId)
+                if (isBatchRetry) {
+                    recentLogs.filter { it.loggedDateKey == targetDateKey }.forEach { offlineStore.markEmailSent(it.id) }
+                }
                 recordServerEmailEvent(
                     log = log,
                     employee = employee,
                     dispatchStatus = EmailReportStatus.SENT.name,
-                    pdfFileName = "NICH_${employee.employeeCode}_${log.loggedDateKey}.pdf"
+                    pdfFileName = if (isBatchRetry) {
+                        "NICH_TEAM_BATCH_${targetDateKey}.pdf"
+                    } else {
+                        "NICH_${employee.employeeCode}_${log.loggedDateKey}.pdf"
+                    }
                 )
                 val activeVerified = _terminalPhase.value as? TerminalUiPhase.Verified
                 if (activeVerified != null && activeVerified.logId == logId && activeVerified.isPersistentLock) {
@@ -579,7 +646,9 @@ class AttendanceViewModel(
         }
         scanTimerJob?.cancel()
         resetTimerJob?.cancel()
+        emailCountdownJob?.cancel()
         scanMatchInFlight = false
+        cnicCommitInFlight = false
         consecutiveMatchCount = 0
         livenessHoldCount = 0
         lastMatchedEmployeeId = null
@@ -603,6 +672,16 @@ class AttendanceViewModel(
      * In continuous kiosk mode, stays ready inside Scanning standby indefinitely without blocking UI.
      */
     fun onCameraInitialized() {
+        val currentCnic = _terminalPhase.value as? TerminalUiPhase.CnicScanning
+        if (currentCnic != null) {
+            if (!currentCnic.cameraReady) {
+                _terminalPhase.update { phase ->
+                    if (phase is TerminalUiPhase.CnicScanning) phase.copy(cameraReady = true) else phase
+                }
+            }
+            return
+        }
+
         val current = _terminalPhase.value as? TerminalUiPhase.Scanning ?: return
         if (current.cameraReady) return
 
@@ -668,8 +747,15 @@ class AttendanceViewModel(
     }
 
     fun onCameraInitFailed(reason: String) {
-        val current = _terminalPhase.value as? TerminalUiPhase.Scanning ?: return
-        if (current.cameraReady || scanMatchInFlight) return
+        when (val current = _terminalPhase.value) {
+            is TerminalUiPhase.Scanning -> {
+                if (current.cameraReady || scanMatchInFlight) return
+            }
+            is TerminalUiPhase.CnicScanning -> {
+                if (current.cameraReady || cnicCommitInFlight) return
+            }
+            else -> return
+        }
         scanTimerJob?.cancel()
         _terminalPhase.value = TerminalUiPhase.Failure(
             title = "Camera Hardware Unavailable",
@@ -847,11 +933,12 @@ class AttendanceViewModel(
             consecutiveMatchCount = 1
         }
 
-        // Smooth verification lock: accept any registered employee match >= 50% confidence with live proof
+        // Step A complete: transition seamlessly to rear-camera Step B CNIC Front-Side verification
         if (consecutiveMatchCount >= REQUIRED_CONFIRMING_FRAMES &&
             match.confidencePercent >= FaceBiometricMatcher.MATCH_THRESHOLD_PERCENT
         ) {
             scanMatchInFlight = true
+            cnicCommitInFlight = false
             scanTimerJob?.cancel()
             val method = if (current.attempt == 1) {
                 VerificationMethod.FACE_SCAN_1
@@ -860,16 +947,109 @@ class AttendanceViewModel(
             }
             val capturedSelfie = frame.selfieImagePath ?: latestCapturedSelfiePath
 
+            _terminalPhase.value = TerminalUiPhase.CnicScanning(
+                employee = match.employee,
+                faceConfidenceScore = match.confidencePercent,
+                verificationMethod = method,
+                liveSelfiePath = capturedSelfie,
+                cameraReady = false,
+                statusHeadline = "STEP B • HOLD ${match.employee.name.uppercase()} CNIC INSIDE GREEN FRAME"
+            )
+            voiceSpeaker.speak(
+                VoicePromptScript.switchToCnicStepPrompt(match.employee.name),
+                flush = true
+            )
+        }
+    }
+
+    /**
+     * Step B: Evaluates live rear-camera OCR frames inside the Green Guide Frame against the
+     * face-verified employee's identity/CNIC, completing attendance upon exact match.
+     */
+    fun onCnicFrameAnalyzed(frame: CnicScanFrame) {
+        val activeLock = offlineStore.pendingCheckOutLock.value
+        if (activeLock != null) {
+            restorePhaseFromPendingLock(
+                lock = activeLock,
+                triggerVoice = frame.cardDetected,
+                throttleVoice = true
+            )
+            return
+        }
+        val current = _terminalPhase.value as? TerminalUiPhase.CnicScanning ?: return
+        if (cnicCommitInFlight) return
+
+        val outcome = CnicOcrParser.verifyAgainstEmployee(frame, current.employee)
+        val displayCnicNum = outcome.matchedCnicNumber.ifBlank { frame.cnicNumber }
+        val displayCnicName = outcome.matchedName.ifBlank { frame.extractedName }
+
+        if (frame.cardDetected && frame.insideGreenFrame && outcome.matched) {
+            cnicCommitInFlight = true
+            val resolvedName = displayCnicName.ifBlank { current.employee.cnicName.ifBlank { current.employee.name } }
+            val resolvedCnicNumber = displayCnicNum.ifBlank { current.employee.cnicNumber }
+            _terminalPhase.update { phase ->
+                if (phase is TerminalUiPhase.CnicScanning) {
+                    phase.copy(
+                        cardDetected = true,
+                        insideGreenFrame = true,
+                        detectedCnicName = resolvedName,
+                        detectedCnicNumber = resolvedCnicNumber,
+                        qualityHint = null
+                    )
+                } else {
+                    phase
+                }
+            }
             viewModelScope.launch {
                 commitVerifiedAttendance(
-                    employee = match.employee,
-                    method = method,
-                    confidence = match.confidencePercent,
+                    employee = current.employee,
+                    method = current.verificationMethod,
+                    confidence = current.faceConfidenceScore,
                     explicitEventType = null,
-                    liveSelfiePath = capturedSelfie
+                    liveSelfiePath = current.liveSelfiePath,
+                    matchedCnicName = resolvedName,
+                    matchedCnicNumber = resolvedCnicNumber,
+                    cnicPhotoPath = frame.cnicImagePath
                 )
             }
+            return
         }
+
+        val hintText = if (!frame.cardDetected || !frame.insideGreenFrame) {
+            frame.qualityIssue ?: "Hold CNIC Front Side inside the Green Guide Frame"
+        } else {
+            outcome.reason
+        }
+        _terminalPhase.update { phase ->
+            if (phase is TerminalUiPhase.CnicScanning) {
+                phase.copy(
+                    cardDetected = frame.cardDetected,
+                    insideGreenFrame = frame.insideGreenFrame,
+                    detectedCnicName = displayCnicName,
+                    detectedCnicNumber = displayCnicNum,
+                    qualityHint = hintText
+                )
+            } else {
+                phase
+            }
+        }
+        if (frame.cardDetected && frame.insideGreenFrame && !outcome.matched &&
+            (displayCnicName.isNotBlank() || displayCnicNum.isNotBlank() || frame.rawOcrText.isNotBlank())
+        ) {
+            speakScanGuidance(
+                key = "cnic_mismatch",
+                message = VoicePromptScript.cnicMismatchPrompt(current.employee.name),
+                minIntervalMs = 4_500L,
+                urgent = true
+            )
+        }
+    }
+
+    fun cancelCnicStepToFaceScan() {
+        startVipBiometricScan(
+            livenessSequence = listOf(LivenessDirection.CENTER_VERIFY),
+            preserveCameraReady = false
+        )
     }
 
     private suspend fun commitVerifiedAttendance(
@@ -877,7 +1057,10 @@ class AttendanceViewModel(
         method: VerificationMethod,
         confidence: Int,
         explicitEventType: AttendanceEventType?,
-        liveSelfiePath: String? = null
+        liveSelfiePath: String? = null,
+        matchedCnicName: String = "",
+        matchedCnicNumber: String = "",
+        cnicPhotoPath: String? = null
     ) {
         val networkSnapshot = runCatching { activeTimeProvider.syncNow() }
             .getOrElse { activeTimeProvider.currentSnapshot() }
@@ -897,7 +1080,7 @@ class AttendanceViewModel(
         lastVerifiedEmployeeId = employee.id
         lastVerifiedTimestampMs = System.currentTimeMillis()
 
-        // Persist immediately to local storage with NTP-locked time & verified GPS location
+        // Persist immediately to local storage with NTP-locked time, verified GPS location, & CNIC match
         val localEntry = offlineStore.recordLocalAttendance(
             employee = employee,
             eventType = eventType,
@@ -908,15 +1091,29 @@ class AttendanceViewModel(
             synced = false,
             gpsCoordinates = gpsCoords,
             locationAddress = readableAddr,
-            timeSource = timeSourceLabel
+            timeSource = timeSourceLabel,
+            matchedCnicName = matchedCnicName,
+            matchedCnicNumber = matchedCnicNumber
         )
         val durableSelfiePath = offlineStore.persistSelfieForLog(localEntry.id, liveSelfiePath)
             ?: liveSelfiePath
+        val durableCnicPath = offlineStore.persistCnicPhotoForLog(localEntry.id, cnicPhotoPath)
+            ?: cnicPhotoPath
 
-        val initialEmailStatus = if (eventType == AttendanceEventType.CHECK_IN) {
-            "NOT_APPLICABLE"
-        } else {
+        // Evaluate Single- vs Multi-Employee daily completion status AFTER recording this event
+        val batchStatus = offlineStore.getBatchCycleStatus(dateKey)
+        val isBatchMode = batchStatus.isMultiEmployeeMode
+        val isBatchAllDone = if (isBatchMode) batchStatus.allCompleted else true
+        val isReadyToDispatchEmail = (eventType == AttendanceEventType.CHECK_OUT) &&
+            (!isBatchMode || batchStatus.allCompleted)
+        val isWaitingOthersInBatch = (eventType == AttendanceEventType.CHECK_OUT) &&
+            isBatchMode &&
+            !batchStatus.allCompleted
+
+        val initialEmailStatus = if (isReadyToDispatchEmail) {
             "PENDING"
+        } else {
+            "NOT_APPLICABLE"
         }
         offlineStore.markServerEmployeePending(employee.id)
         offlineStore.markServerLogPending(
@@ -945,11 +1142,24 @@ class AttendanceViewModel(
             emailReportStatus = EmailReportStatus.NEEDS_CONFIG,
             emailEnforcementWarningActive = false,
             emailEnforcementMessage = null,
-            checkOutEmailTriggeredOrSent = eventType != AttendanceEventType.CHECK_OUT
+            checkOutEmailTriggeredOrSent = !isReadyToDispatchEmail,
+            matchedCnicName = matchedCnicName,
+            matchedCnicNumber = matchedCnicNumber,
+            cnicPhotoPath = durableCnicPath,
+            isBatchMode = isBatchMode,
+            batchCompletedCount = if (isBatchMode) batchStatus.completedCount else 1,
+            batchTotalCount = batchStatus.totalEnrolledCount.coerceAtLeast(1),
+            batchAllCompleted = isBatchAllDone,
+            batchPendingEmployeeNames = batchStatus.incompleteEmployeeNames,
+            batchDateKey = dateKey
         )
 
         voiceSpeaker.speak(
-            VoicePromptScript.verificationPrompt(employee.name, eventType),
+            VoicePromptScript.verificationPrompt(
+                employeeName = employee.name,
+                eventType = eventType,
+                isBatchWaitingOthers = isWaitingOthersInBatch
+            ),
             flush = true
         )
 
@@ -990,13 +1200,13 @@ class AttendanceViewModel(
             }
         }
 
-        // Conditional Email Notification & Strict Check-Out Enforcement:
-        // - CHECK-IN: Never dispatch email. Auto-return to live scanning after 2.5s.
-        // - CHECK-OUT: Persist durable offline Check-Out lock immediately BEFORE dispatching SMTP
-        //              so closing or killing the app cannot bypass pending email verification.
-        if (eventType == AttendanceEventType.CHECK_IN) {
+        // Conditional Email Notification & Strict Smart Batch / Check-Out Enforcement:
+        // - CHECK-IN or Multi-Employee awaiting remaining staff: Save locally & return to scanning.
+        // - CHECK-OUT ready (Single Employee OR all Multi-Employee staff done): Persist durable lock & enforce email.
+        if (!isReadyToDispatchEmail) {
             scheduleAutoResetToReady()
         } else {
+            val totalEnrolled = batchStatus.totalEnrolledCount.coerceAtLeast(1)
             offlineStore.savePendingCheckOutLock(
                 PendingCheckOutLock(
                     logId = localEntry.id,
@@ -1014,7 +1224,10 @@ class AttendanceViewModel(
                     gpsCoordinates = gpsCoords,
                     locationAddress = readableAddr,
                     timeSource = timeSourceLabel,
-                    liveSelfiePath = durableSelfiePath.orEmpty()
+                    liveSelfiePath = durableSelfiePath.orEmpty(),
+                    isConsolidatedBatch = isBatchMode,
+                    batchDateKey = if (isBatchMode) dateKey else "",
+                    batchEmployeeCount = totalEnrolled
                 )
             )
             val reporter = emailReporter
@@ -1026,32 +1239,56 @@ class AttendanceViewModel(
                         phase
                     }
                 }
-                launchEmailReportDispatch(
-                    employee = employee,
-                    log = localEntry,
-                    eventType = eventType,
-                    verificationMethod = method,
-                    confidence = confidence,
-                    syncedToCloud = false,
-                    liveSelfiePath = durableSelfiePath,
-                    rescheduleResetAfter = false
-                )
+                if (isBatchMode) {
+                    launchBatchEmailReportDispatch(
+                        logId = localEntry.id,
+                        employee = employee,
+                        log = localEntry,
+                        dateKey = dateKey,
+                        syncedToCloud = false
+                    )
+                } else {
+                    launchEmailReportDispatch(
+                        employee = employee,
+                        log = localEntry,
+                        eventType = eventType,
+                        verificationMethod = method,
+                        confidence = confidence,
+                        syncedToCloud = false,
+                        liveSelfiePath = durableSelfiePath,
+                        rescheduleResetAfter = false
+                    )
+                }
             } else {
-                // Pre-generate & persist the structured weekly PDF report immediately for offline lock / Gmail dispatch
+                // Pre-generate & persist the structured PDF report immediately for offline lock / Gmail dispatch
                 if (reporter != null) {
                     val recentLogsSnapshot = offlineStore.logs.value
-                    viewModelScope.launch {
+                    val batchEmployees = offlineStore.getRegisteredBiometricEmployees()
+                        .ifEmpty { offlineStore.employees.value }
+                    val dateLogsSnapshot = recentLogsSnapshot.filter { it.loggedDateKey == dateKey }
+                    val selfiesSnapshot = offlineStore.getSelfiePathsByLogId()
+                    pdfPreGenJob?.cancel()
+                    pdfPreGenJob = viewModelScope.launch {
                         runCatching {
-                            reporter.generateReportPdfFile(
-                                employee = employee,
-                                log = localEntry,
-                                eventType = eventType,
-                                verificationMethod = method,
-                                confidenceScore = confidence,
-                                syncedToCloud = false,
-                                recentDailyLogs = recentLogsSnapshot,
-                                liveSelfiePath = durableSelfiePath
-                            )
+                            if (isBatchMode) {
+                                reporter.generateBatchReportPdfFile(
+                                    employees = batchEmployees,
+                                    logs = dateLogsSnapshot,
+                                    dateKey = dateKey,
+                                    selfiePathsByLogId = selfiesSnapshot
+                                )
+                            } else {
+                                reporter.generateReportPdfFile(
+                                    employee = employee,
+                                    log = localEntry,
+                                    eventType = eventType,
+                                    verificationMethod = method,
+                                    confidenceScore = confidence,
+                                    syncedToCloud = false,
+                                    recentDailyLogs = recentLogsSnapshot,
+                                    liveSelfiePath = durableSelfiePath
+                                )
+                            }
                         }.onSuccess { pdfFile ->
                             offlineStore.updatePendingCheckOutPdfPath(localEntry.id, pdfFile.absolutePath)
                             _terminalPhase.update { phase ->
@@ -1114,7 +1351,9 @@ class AttendanceViewModel(
                 ) {
                     break
                 }
-                if (current.emailReportStatus != EmailReportStatus.DISPATCHING) {
+                if (current.emailReportStatus != EmailReportStatus.DISPATCHING &&
+                    current.emailAutoUnlockSecondsRemaining == null
+                ) {
                     val activePrompt = if (current.isPersistentLock) {
                         VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
                     } else {
@@ -1137,169 +1376,214 @@ class AttendanceViewModel(
     }
 
     /**
-     * Dispatches the individual attendance PDF report and live selfie photo
-     * to Nichemployeeattendance@gmail.com when the employee taps Send Email & Finish
-     * after a recorded Check-Out, then returns the terminal to active Scanning.
+     * Dispatches either the single-employee PDF report or the consolidated multi-employee
+     * batch PDF report to Nichemployeeattendance@gmail.com when enabled and tapped by the user,
+     * then initiates a 5-second countdown timer that automatically resolves & clears the pending
+     * email lock and returns the terminal to active unlocked scanning.
      */
     fun sendEmailAndFinish(onLaunchEmailIntent: (Intent) -> Unit) {
         val current = _terminalPhase.value as? TerminalUiPhase.Verified ?: run {
             resetToReady()
             return
         }
-        if (current.emailReportStatus == EmailReportStatus.DISPATCHING) return
+        if (current.isBatchMode && !current.batchAllCompleted) return
+        if (current.emailAutoUnlockSecondsRemaining != null ||
+            current.emailReportStatus == EmailReportStatus.DISPATCHING
+        ) {
+            return
+        }
 
         resetTimerJob?.cancel()
         emailReminderJob?.cancel()
-
-        val reporter = emailReporter
-        if (reporter == null) {
-            _terminalPhase.update { phase ->
-                if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
-                    phase.copy(checkOutEmailTriggeredOrSent = true)
-                } else {
-                    phase
-                }
-            }
-            resetToReady()
-            return
-        }
+        emailCountdownJob?.cancel()
 
         val matchingLog = buildLogForVerifiedPhase(current)
         val snapshotLogs = offlineStore.logs.value
-
-        if (current.emailReportStatus == EmailReportStatus.SENT || current.checkOutEmailTriggeredOrSent) {
-            _terminalPhase.update { phase ->
-                if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
-                    phase.copy(checkOutEmailTriggeredOrSent = true, emailEnforcementWarningActive = false)
-                } else {
-                    phase
-                }
+        val targetDateKey = current.batchDateKey.ifBlank {
+            matchingLog.loggedDateKey.ifBlank {
+                AttendanceTimeRules.formatDateKey(activeTimeProvider.currentCalendar())
             }
-            resetToReady()
-            return
         }
+        val reporter = emailReporter
+        val smtpConfigured = reporter?.hasConfiguredSmtpCredentials() == true
 
         _terminalPhase.update { phase ->
             if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
                 phase.copy(
                     emailReportStatus = EmailReportStatus.DISPATCHING,
-                    emailEnforcementWarningActive = false
+                    emailEnforcementWarningActive = false,
+                    emailAutoUnlockSecondsRemaining = EMAIL_AUTO_UNLOCK_SECONDS
                 )
             } else {
                 phase
             }
         }
 
-        viewModelScope.launch {
-            val smtpConfigured = reporter.hasConfiguredSmtpCredentials()
-            var dispatchedViaSmtp = false
-            var openedDeviceShare = false
-
-            if (smtpConfigured) {
-                val outcome = reporter.generateAndSendReport(
-                    employee = current.employee,
-                    log = matchingLog,
-                    eventType = current.eventType,
-                    verificationMethod = current.verificationMethod,
-                    confidenceScore = current.confidenceScore,
-                    syncedToCloud = current.syncedToCloud,
-                    recentDailyLogs = snapshotLogs,
-                    liveSelfiePath = current.liveSelfiePath
-                )
-                if (outcome == EmailReportStatus.SENT) {
-                    offlineStore.clearPendingCheckOutLock(matchingLog.id)
-                    recordServerEmailEvent(
-                        log = matchingLog,
-                        employee = current.employee,
-                        dispatchStatus = EmailReportStatus.SENT.name,
-                        pdfFileName = current.pdfReportPath.substringAfterLast('/')
-                    )
-                    retryPendingEmailReports()
-                    dispatchedViaSmtp = true
-                } else {
+        if (reporter != null) {
+            viewModelScope.launch {
+                var openedDeviceShare = false
+                if (smtpConfigured) {
+                    val outcome = if (current.isBatchMode) {
+                        val batchEmployees = offlineStore.getRegisteredBiometricEmployees()
+                            .ifEmpty { offlineStore.employees.value }
+                        val dateLogs = snapshotLogs.filter { it.loggedDateKey == targetDateKey }
+                        val selfiesMap = offlineStore.getSelfiePathsByLogId()
+                        reporter.generateAndSendBatchReport(
+                            employees = batchEmployees,
+                            logs = dateLogs,
+                            dateKey = targetDateKey,
+                            selfiePathsByLogId = selfiesMap,
+                            syncedToCloud = current.syncedToCloud
+                        )
+                    } else {
+                        reporter.generateAndSendReport(
+                            employee = current.employee,
+                            log = matchingLog,
+                            eventType = current.eventType,
+                            verificationMethod = current.verificationMethod,
+                            confidenceScore = current.confidenceScore,
+                            syncedToCloud = current.syncedToCloud,
+                            recentDailyLogs = snapshotLogs,
+                            liveSelfiePath = current.liveSelfiePath
+                        )
+                    }
                     recordServerEmailEvent(
                         log = matchingLog,
                         employee = current.employee,
                         dispatchStatus = outcome.name,
                         pdfFileName = current.pdfReportPath.substringAfterLast('/')
                     )
-                }
-            } else {
-                runCatching {
-                    val existingPdf = current.pdfReportPath
-                        .takeIf { it.isNotBlank() }
-                        ?.let { java.io.File(it) }
-                        ?.takeIf { it.exists() && it.length() > 0L }
-                    val pdfFile = existingPdf ?: reporter.generateReportPdfFile(
-                        employee = current.employee,
-                        log = matchingLog,
-                        eventType = current.eventType,
-                        verificationMethod = current.verificationMethod,
-                        confidenceScore = current.confidenceScore,
-                        syncedToCloud = current.syncedToCloud,
-                        recentDailyLogs = snapshotLogs,
-                        liveSelfiePath = current.liveSelfiePath
-                    )
-                    offlineStore.updatePendingCheckOutPdfPath(matchingLog.id, pdfFile.absolutePath)
-                    val gmailIntent = reporter.buildDeviceGmailShareIntent(
-                        pdfFile = pdfFile,
-                        employee = current.employee,
-                        log = matchingLog,
-                        eventType = current.eventType,
-                        verificationMethod = current.verificationMethod,
-                        confidenceScore = current.confidenceScore,
-                        syncedToCloud = current.syncedToCloud
-                    )
-                    offlineStore.clearPendingCheckOutLock(matchingLog.id)
-                    recordServerEmailEvent(
-                        log = matchingLog,
-                        employee = current.employee,
-                        dispatchStatus = "DEVICE_GMAIL_INTENT",
-                        pdfFileName = pdfFile.name
-                    )
-                    onLaunchEmailIntent(gmailIntent)
-                    openedDeviceShare = true
-                }.onFailure { err ->
-                    Log.w(TAG, "Failed to launch Gmail share intent: ${err.message}")
-                }
-            }
-            triggerServerSyncAsync()
+                    _terminalPhase.update { phase ->
+                        if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                            phase.copy(emailReportStatus = outcome)
+                        } else {
+                            phase
+                        }
+                    }
+                } else {
+                    runCatching {
+                        pdfPreGenJob?.join()
+                        val latestPdfPath = (_terminalPhase.value as? TerminalUiPhase.Verified)
+                            ?.takeIf { it.logId == current.logId }
+                            ?.pdfReportPath
+                            ?.ifBlank { offlineStore.pendingCheckOutLock.value?.pdfReportPath.orEmpty() }
+                            ?: current.pdfReportPath
+                        val existingPdf = latestPdfPath
+                            .takeIf { it.isNotBlank() }
+                            ?.let { java.io.File(it) }
+                            ?.takeIf { it.exists() && it.length() > 0L }
+                        val batchEmployees = offlineStore.getRegisteredBiometricEmployees()
+                            .ifEmpty { offlineStore.employees.value }
+                        val dateLogs = snapshotLogs.filter { it.loggedDateKey == targetDateKey }
+                        val selfiesMap = offlineStore.getSelfiePathsByLogId()
 
-            if (dispatchedViaSmtp || openedDeviceShare) {
-                _terminalPhase.update { phase ->
-                    if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
-                        phase.copy(
-                            checkOutEmailTriggeredOrSent = true,
-                            isPersistentLock = false,
-                            emailEnforcementWarningActive = false,
-                            emailReportStatus = if (dispatchedViaSmtp) EmailReportStatus.SENT else EmailReportStatus.QUEUED_OFFLINE
+                        val pdfFile = existingPdf ?: if (current.isBatchMode) {
+                            reporter.generateBatchReportPdfFile(
+                                employees = batchEmployees,
+                                logs = dateLogs,
+                                dateKey = targetDateKey,
+                                selfiePathsByLogId = selfiesMap
+                            )
+                        } else {
+                            reporter.generateReportPdfFile(
+                                employee = current.employee,
+                                log = matchingLog,
+                                eventType = current.eventType,
+                                verificationMethod = current.verificationMethod,
+                                confidenceScore = current.confidenceScore,
+                                syncedToCloud = current.syncedToCloud,
+                                recentDailyLogs = snapshotLogs,
+                                liveSelfiePath = current.liveSelfiePath
+                            )
+                        }
+                        offlineStore.updatePendingCheckOutPdfPath(matchingLog.id, pdfFile.absolutePath)
+                        val gmailIntent = if (current.isBatchMode) {
+                            reporter.buildDeviceGmailBatchShareIntent(
+                                pdfFile = pdfFile,
+                                employees = batchEmployees,
+                                logs = dateLogs,
+                                dateKey = targetDateKey,
+                                syncedToCloud = current.syncedToCloud
+                            )
+                        } else {
+                            reporter.buildDeviceGmailShareIntent(
+                                pdfFile = pdfFile,
+                                employee = current.employee,
+                                log = matchingLog,
+                                eventType = current.eventType,
+                                verificationMethod = current.verificationMethod,
+                                confidenceScore = current.confidenceScore,
+                                syncedToCloud = current.syncedToCloud
+                            )
+                        }
+                        recordServerEmailEvent(
+                            log = matchingLog,
+                            employee = current.employee,
+                            dispatchStatus = "DEVICE_GMAIL_INTENT",
+                            pdfFileName = pdfFile.name
                         )
-                    } else {
-                        phase
+                        onLaunchEmailIntent(gmailIntent)
+                        openedDeviceShare = true
+                    }.onFailure { err ->
+                        Log.w(TAG, "Email intent preparation deferred: ${err.message}")
+                    }
+                    _terminalPhase.update { phase ->
+                        if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                            phase.copy(emailReportStatus = EmailReportStatus.QUEUED_OFFLINE)
+                        } else {
+                            phase
+                        }
                     }
                 }
+                triggerServerSyncAsync()
                 voiceSpeaker.speak(
                     VoicePromptScript.emailDispatchedPrompt(openedDeviceApp = openedDeviceShare),
                     flush = true
                 )
-                resetToReady()
-            } else {
-                val lockPrompt = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
+            }
+        }
+
+        // 5-second countdown timer: resolves & clears pending email status and unlocks terminal automatically
+        emailCountdownJob = viewModelScope.launch {
+            for (remaining in EMAIL_AUTO_UNLOCK_SECONDS downTo 1) {
                 _terminalPhase.update { phase ->
                     if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
-                        phase.copy(
-                            emailReportStatus = EmailReportStatus.QUEUED_OFFLINE,
-                            isPersistentLock = true,
-                            emailEnforcementWarningActive = true,
-                            emailEnforcementMessage = lockPrompt
-                        )
+                        phase.copy(emailAutoUnlockSecondsRemaining = remaining)
                     } else {
                         phase
                     }
                 }
-                voiceSpeaker.speak(lockPrompt, flush = true)
-                startCheckOutEmailEnforcementLoop(current.logId, lockPrompt)
+                delay(1_000L)
             }
+
+            offlineStore.clearPendingCheckOutLock(matchingLog.id)
+            if (current.isBatchMode) {
+                offlineStore.logs.value
+                    .filter { it.loggedDateKey == targetDateKey }
+                    .forEach { offlineStore.markEmailSent(it.id) }
+            }
+            if (smtpConfigured) {
+                retryPendingEmailReports()
+            }
+            _terminalPhase.update { phase ->
+                if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
+                    phase.copy(
+                        checkOutEmailTriggeredOrSent = true,
+                        isPersistentLock = false,
+                        emailEnforcementWarningActive = false,
+                        emailAutoUnlockSecondsRemaining = null
+                    )
+                } else {
+                    phase
+                }
+            }
+            if (reporter == null || !smtpConfigured) {
+                voiceSpeaker.speak(
+                    VoicePromptScript.emailDispatchedPrompt(openedDeviceApp = false),
+                    flush = true
+                )
+            }
+            resetToReady()
         }
     }
 
@@ -1440,6 +1724,74 @@ class AttendanceViewModel(
         }
     }
 
+    private fun launchBatchEmailReportDispatch(
+        logId: String,
+        employee: Employee,
+        log: AttendanceLog,
+        dateKey: String,
+        syncedToCloud: Boolean
+    ) {
+        val reporter = emailReporter ?: return
+        val batchEmployees = offlineStore.getRegisteredBiometricEmployees()
+            .ifEmpty { offlineStore.employees.value }
+        val dateLogs = offlineStore.logs.value.filter { it.loggedDateKey == dateKey }
+        val selfiesMap = offlineStore.getSelfiePathsByLogId()
+        emailDispatchJob?.cancel()
+        emailDispatchJob = viewModelScope.launch {
+            val outcome = reporter.generateAndSendBatchReport(
+                employees = batchEmployees,
+                logs = dateLogs,
+                dateKey = dateKey,
+                selfiePathsByLogId = selfiesMap,
+                syncedToCloud = syncedToCloud
+            )
+            if (outcome == EmailReportStatus.QUEUED_OFFLINE) {
+                offlineStore.markEmailPending(logId)
+            } else if (outcome == EmailReportStatus.SENT) {
+                offlineStore.clearPendingCheckOutLock(logId)
+                dateLogs.forEach { offlineStore.markEmailSent(it.id) }
+                emailReminderJob?.cancel()
+                retryPendingEmailReports()
+                voiceSpeaker.speak(
+                    VoicePromptScript.emailDispatchedPrompt(openedDeviceApp = false),
+                    flush = false
+                )
+            }
+            recordServerEmailEvent(
+                log = log,
+                employee = employee,
+                dispatchStatus = outcome.name,
+                pdfFileName = "NICH_TEAM_BATCH_${dateKey}.pdf"
+            )
+            triggerServerSyncAsync()
+            val lockFailedCheckOut = outcome != EmailReportStatus.SENT
+            _terminalPhase.update { current ->
+                if (current is TerminalUiPhase.Verified && current.logId == logId) {
+                    current.copy(
+                        emailReportStatus = outcome,
+                        checkOutEmailTriggeredOrSent = outcome == EmailReportStatus.SENT || current.checkOutEmailTriggeredOrSent,
+                        isPersistentLock = if (outcome == EmailReportStatus.SENT) false else true,
+                        emailEnforcementWarningActive = if (outcome == EmailReportStatus.SENT) false else lockFailedCheckOut,
+                        emailEnforcementMessage = if (lockFailedCheckOut) {
+                            VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
+                        } else {
+                            current.emailEnforcementMessage
+                        }
+                    )
+                } else {
+                    current
+                }
+            }
+            if (lockFailedCheckOut) {
+                voiceSpeaker.speak(VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT, flush = true)
+                startCheckOutEmailEnforcementLoop(
+                    logId = logId,
+                    promptMessage = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT
+                )
+            }
+        }
+    }
+
     private fun recordServerEmailEvent(
         log: AttendanceLog,
         employee: Employee,
@@ -1541,7 +1893,9 @@ class AttendanceViewModel(
         scanTimerJob?.cancel()
         resetTimerJob?.cancel()
         emailReminderJob?.cancel()
+        emailCountdownJob?.cancel()
         scanMatchInFlight = false
+        cnicCommitInFlight = false
         consecutiveMatchCount = 0
         livenessHoldCount = 0
         lastMatchedEmployeeId = null
@@ -1565,6 +1919,7 @@ class AttendanceViewModel(
         scanTimerJob?.cancel()
         resetTimerJob?.cancel()
         emailReminderJob?.cancel()
+        emailCountdownJob?.cancel()
         voiceSpeaker.shutdown()
     }
 
@@ -1573,6 +1928,7 @@ class AttendanceViewModel(
         const val ATTEMPT_DURATION_MS = 7000L
         const val VERIFIED_AUTO_RESET_MS = 2500L
         const val EMAIL_ENFORCEMENT_INTERVAL_MS = 6000L
+        const val EMAIL_AUTO_UNLOCK_SECONDS = 5
         const val WELCOME_THROTTLE_MS = 30_000L
         const val SCAN_GUIDANCE_THROTTLE_MS = 5500L
         const val GLOBAL_SCAN_VOICE_GAP_MS = 3200L

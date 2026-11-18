@@ -89,10 +89,16 @@ data class EmployeeDraftItem(
     val name: String = "",
     val department: String = "Authorized Staff",
     val photoPath: String = "",
-    val faceSignature: String = ""
+    val faceSignature: String = "",
+    val cnicPhotoPath: String = "",
+    val cnicNumber: String = "",
+    val cnicName: String = ""
 ) {
     val isComplete: Boolean
-        get() = name.isNotBlank() && photoPath.isNotBlank() && faceSignature.isNotBlank()
+        get() = name.isNotBlank() &&
+            photoPath.isNotBlank() &&
+            faceSignature.isNotBlank() &&
+            cnicPhotoPath.isNotBlank()
 }
 
 @Composable
@@ -283,7 +289,7 @@ fun EmployeeRegistrationScreen(
                                 if (readyDrafts.isEmpty() || incompleteIndex >= 0) {
                                     val idx = if (incompleteIndex >= 0) incompleteIndex + 1 else 1
                                     formErrorText =
-                                        "Employee #$idx needs both a live captured face photo and full name before saving."
+                                        "Employee #$idx needs full name, live face capture, and CNIC front-side capture before saving."
                                     return@Button
                                 }
                                 onRegisterBatch(
@@ -292,7 +298,10 @@ fun EmployeeRegistrationScreen(
                                             name = it.name.trim(),
                                             department = it.department.trim().ifEmpty { "Authorized Staff" },
                                             photoPath = it.photoPath,
-                                            faceSignature = it.faceSignature
+                                            faceSignature = it.faceSignature,
+                                            cnicPhotoPath = it.cnicPhotoPath,
+                                            cnicNumber = it.cnicNumber.trim(),
+                                            cnicName = it.cnicName.trim().ifBlank { it.name.trim() }
                                         )
                                     }
                                 )
@@ -347,15 +356,21 @@ fun EmployeeRegistrationScreen(
             }
         }
 
-        // CameraX Live Face Photo Capture Modal
+        // CameraX Live Face Photo + Rear CNIC Front-Side Auto-Capture Modal
         val captureTargetIndex = activeCaptureDraftIndex
         if (captureTargetIndex != null && captureTargetIndex in drafts.indices) {
             LiveRegistrationCameraOverlay(
                 employeeIndex = captureTargetIndex + 1,
-                onCaptured = { capturedPath, capturedSignature ->
-                    drafts[captureTargetIndex] = drafts[captureTargetIndex].copy(
+                onCaptured = { capturedPath, capturedSignature, capturedCnicPath, cnicNumber, cnicName ->
+                    val currentDraft = drafts[captureTargetIndex]
+                    val resolvedName = currentDraft.name.ifBlank { cnicName }
+                    drafts[captureTargetIndex] = currentDraft.copy(
+                        name = resolvedName,
                         photoPath = capturedPath,
-                        faceSignature = capturedSignature
+                        faceSignature = capturedSignature,
+                        cnicPhotoPath = capturedCnicPath,
+                        cnicNumber = cnicNumber,
+                        cnicName = cnicName.ifBlank { resolvedName }
                     )
                     activeCaptureDraftIndex = null
                 },
@@ -381,6 +396,16 @@ private fun EmployeeDraftCard(
         } else {
             runCatching {
                 val f = File(draft.photoPath)
+                if (f.exists() && f.length() > 0L) BitmapFactory.decodeFile(f.absolutePath)?.asImageBitmap() else null
+            }.getOrNull()
+        }
+    }
+    val cnicPreviewBitmap = remember(draft.cnicPhotoPath) {
+        if (draft.cnicPhotoPath.isBlank()) {
+            null
+        } else {
+            runCatching {
+                val f = File(draft.cnicPhotoPath)
                 if (f.exists() && f.length() > 0L) BitmapFactory.decodeFile(f.absolutePath)?.asImageBitmap() else null
             }.getOrNull()
         }
@@ -481,8 +506,8 @@ private fun EmployeeDraftCard(
                         onClick = onCapturePhotoClick,
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (previewBitmap != null) ObsidianElevated else NeonCyan,
-                            contentColor = if (previewBitmap != null) NeonCyan else ObsidianVoid
+                            containerColor = if (previewBitmap != null && cnicPreviewBitmap != null) ObsidianElevated else NeonCyan,
+                            contentColor = if (previewBitmap != null && cnicPreviewBitmap != null) NeonCyan else ObsidianVoid
                         ),
                         modifier = Modifier
                             .fillMaxWidth()
@@ -496,10 +521,10 @@ private fun EmployeeDraftCard(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = if (previewBitmap != null) {
-                                stringResource(R.string.retake_photo)
+                            text = if (previewBitmap != null && cnicPreviewBitmap != null) {
+                                stringResource(R.string.retake_face_and_cnic)
                             } else {
-                                stringResource(R.string.capture_live_photo)
+                                stringResource(R.string.capture_face_and_cnic)
                             },
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
@@ -508,15 +533,36 @@ private fun EmployeeDraftCard(
                     }
 
                     Text(
-                        text = if (draft.faceSignature.isNotBlank()) {
-                            "Face embedding locked for 50%+ fast recognition"
-                        } else {
-                            "Tap to capture live face photo & embedding"
+                        text = when {
+                            draft.faceSignature.isNotBlank() && draft.cnicPhotoPath.isNotBlank() ->
+                                "Face & CNIC Front saved${if (draft.cnicNumber.isNotBlank()) " (${draft.cnicNumber})" else ""}"
+                            draft.faceSignature.isNotBlank() ->
+                                "Face locked • CNIC front capture required"
+                            else ->
+                                "Tap to capture Live Face + Rear CNIC Front"
                         },
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (draft.faceSignature.isNotBlank()) NeonGreen else NeonAmber,
+                        color = if (draft.faceSignature.isNotBlank() && draft.cnicPhotoPath.isNotBlank()) NeonGreen else NeonAmber,
                         maxLines = 2
                     )
+                }
+
+                if (cnicPreviewBitmap != null) {
+                    Box(
+                        modifier = Modifier
+                            .size(width = 72.dp, height = 46.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(ObsidianElevated)
+                            .border(1.5.dp, NeonGreen, RoundedCornerShape(8.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Image(
+                            bitmap = cnicPreviewBitmap,
+                            contentDescription = "Captured CNIC front preview",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
                 }
             }
 
@@ -636,7 +682,15 @@ private fun SavedEmployeeRow(
                         modifier = Modifier.size(14.dp)
                     )
                     Text(
-                        text = "${employee.employeeCode} • ${employee.department}",
+                        text = buildString {
+                            append(employee.employeeCode)
+                            append(" • ")
+                            append(employee.department)
+                            if (employee.cnicNumber.isNotBlank()) {
+                                append(" • CNIC ")
+                                append(employee.cnicNumber)
+                            }
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary,
                         maxLines = 1,

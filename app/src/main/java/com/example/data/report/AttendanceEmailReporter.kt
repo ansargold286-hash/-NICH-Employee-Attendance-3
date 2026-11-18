@@ -205,8 +205,138 @@ class AttendanceEmailReporter(
         }
     }
 
+    suspend fun generateBatchReportPdfFile(
+        employees: List<Employee>,
+        logs: List<AttendanceLog>,
+        dateKey: String,
+        selfiePathsByLogId: Map<String, String> = emptyMap()
+    ): File = withContext(Dispatchers.IO) {
+        val recipient = resolveRecipientEmail()
+        val pdfFile = AttendancePdfGenerator.generateBatchConsolidatedPdf(
+            context = context,
+            employees = employees,
+            logs = logs,
+            dateKey = dateKey,
+            recipientEmail = recipient,
+            selfiePathsByLogId = selfiePathsByLogId
+        )
+        pruneOldCachedReports(pdfFile)
+        pdfFile
+    }
+
+    suspend fun generateAndSendBatchReport(
+        employees: List<Employee>,
+        logs: List<AttendanceLog>,
+        dateKey: String,
+        selfiePathsByLogId: Map<String, String> = emptyMap(),
+        syncedToCloud: Boolean = false
+    ): EmailReportStatus = withContext(Dispatchers.IO) {
+        val pdfFile = try {
+            generateBatchReportPdfFile(
+                employees = employees,
+                logs = logs,
+                dateKey = dateKey,
+                selfiePathsByLogId = selfiePathsByLogId
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to generate consolidated batch PDF report", e)
+            return@withContext EmailReportStatus.QUEUED_OFFLINE
+        }
+
+        val senderEmail = resolveSenderAccountEmail()
+        val recipientEmail = resolveRecipientEmail()
+        val appPassword = appPasswordProvider().trim()
+        if (appPassword.isEmpty() || appPassword == PLACEHOLDER_PASSWORD) {
+            Log.i(TAG, "Batch PDF generated for device Gmail dispatch (${pdfFile.name}, sender=$senderEmail)")
+            return@withContext EmailReportStatus.NEEDS_CONFIG
+        }
+
+        val subject = buildBatchSubject(dateKey, employees.size)
+        val body = buildBatchPlainTextBody(
+            employees = employees,
+            logs = logs,
+            dateKey = dateKey,
+            syncedToCloud = syncedToCloud,
+            deviceAccountEmail = senderEmail
+        )
+
+        val latestPhotoFile = selfiePathsByLogId.values
+            .lastOrNull { it.isNotBlank() }
+            ?.let { File(it) }
+            ?.takeIf { it.exists() && it.length() > 0L }
+
+        return@withContext try {
+            smtpSender.sendWithAttachment(
+                config = SmtpConfig(
+                    username = senderEmail,
+                    appPassword = appPassword
+                ),
+                toEmail = recipientEmail,
+                subject = subject,
+                plainTextBody = body,
+                attachmentFile = pdfFile,
+                extraAttachmentFile = latestPhotoFile
+            )
+            EmailReportStatus.SENT
+        } catch (e: Exception) {
+            Log.w(TAG, "Background batch SMTP email deferred; PDF preserved for device Gmail: ${e.message}")
+            EmailReportStatus.QUEUED_OFFLINE
+        }
+    }
+
+    fun buildDeviceGmailBatchShareIntent(
+        pdfFile: File,
+        employees: List<Employee>,
+        logs: List<AttendanceLog>,
+        dateKey: String,
+        syncedToCloud: Boolean
+    ): Intent {
+        val recipientEmail = resolveRecipientEmail()
+        val deviceSenderEmail = DeviceAccountResolver.resolveLoggedInGoogleEmail(context)
+        val pdfUri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            pdfFile
+        )
+        val subject = buildBatchSubject(dateKey, employees.size)
+        val body = buildBatchPlainTextBody(
+            employees = employees,
+            logs = logs,
+            dateKey = dateKey,
+            syncedToCloud = syncedToCloud,
+            deviceAccountEmail = deviceSenderEmail
+        )
+
+        val baseIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/pdf"
+            putExtra(Intent.EXTRA_EMAIL, arrayOf(recipientEmail))
+            putExtra(Intent.EXTRA_SUBJECT, subject)
+            putExtra(Intent.EXTRA_TEXT, body)
+            putExtra(Intent.EXTRA_STREAM, pdfUri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+
+        val gmailTargeted = Intent(baseIntent).setPackage(GMAIL_PACKAGE_NAME)
+        val canLaunchGmailDirectly = runCatching {
+            context.packageManager.resolveActivity(gmailTargeted, 0) != null
+        }.getOrDefault(false)
+
+        return if (canLaunchGmailDirectly) {
+            gmailTargeted
+        } else {
+            Intent.createChooser(baseIntent, "Send Consolidated Attendance Batch PDF").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        }
+    }
+
     private fun buildSubject(eventType: AttendanceEventType, employee: Employee): String {
         return "NICH Employee Attendance 3 • ${eventType.displayLabel} • ${employee.name} (${employee.employeeCode})"
+    }
+
+    private fun buildBatchSubject(dateKey: String, employeeCount: Int): String {
+        return "NICH Employee Attendance 3 • CONSOLIDATED BATCH REPORT ($employeeCount Staff) • $dateKey"
     }
 
     private fun buildPlainTextBody(
@@ -225,8 +355,11 @@ class AttendanceEmailReporter(
             appendLine("Employee ID: ${employee.employeeCode}")
             appendLine("Department: ${employee.department}")
             appendLine("Role: ${employee.roleTitle}")
+            if (log.matchedCnicNumber.isNotBlank() || employee.cnicNumber.isNotBlank()) {
+                appendLine("Verified CNIC: ${log.matchedCnicNumber.ifBlank { employee.cnicNumber }}")
+            }
             appendLine("Event Type: ${eventType.displayLabel} (${eventType.wireValue})")
-            appendLine("Verification Method: ${verificationMethod.displayLabel}")
+            appendLine("Verification Method: ${verificationMethod.displayLabel} + CNIC OCR")
             appendLine("Match Confidence: ${confidenceScore.coerceIn(0, 100)}%")
             appendLine("Timestamp: ${log.loggedTimeLabel} (${log.loggedDateKey})")
             appendLine("Time Authority: ${log.timeSource.ifBlank { "Network Time (NTP)" }}")
@@ -238,6 +371,40 @@ class AttendanceEmailReporter(
             }
             appendLine()
             appendLine("The structured PDF attendance report (with live capture photo, GPS address, and weekly summary) is attached.")
+        }
+    }
+
+    private fun buildBatchPlainTextBody(
+        employees: List<Employee>,
+        logs: List<AttendanceLog>,
+        dateKey: String,
+        syncedToCloud: Boolean,
+        deviceAccountEmail: String?
+    ): String {
+        val summary = AttendancePdfGenerator.buildBatchReportSummary(
+            employees = employees,
+            logs = logs,
+            dateKey = dateKey
+        )
+        return buildString {
+            appendLine("NICH Employee Attendance 3 — Consolidated Multi-Employee Daily Report")
+            appendLine("==================================================================")
+            appendLine("Date: ${summary.dateDisplayLabel} ($dateKey)")
+            appendLine("Completed Staff Cycles: ${summary.completedCount}/${summary.totalCount}")
+            appendLine("Total Team Duty Hours: ${summary.totalTeamDutyHoursLabel}")
+            appendLine("GPS Coordinates: ${summary.gpsSummary}")
+            appendLine("Time Authority: ${summary.timeSourceSummary}")
+            appendLine("Cloud Sync: ${if (syncedToCloud) "Cloud Firestore Live" else "Saved Offline (Queued)"}")
+            if (!deviceAccountEmail.isNullOrBlank()) {
+                appendLine("Dispatched From Device Account: $deviceAccountEmail")
+            }
+            appendLine()
+            appendLine("Employee Breakdown:")
+            summary.rows.forEachIndexed { idx, row ->
+                appendLine("${idx + 1}. ${row.employee.name} (${row.employee.employeeCode}) — In: ${row.checkInLabel} | Out: ${row.checkOutLabel} | Duty: ${row.dutyHoursLabel}")
+            }
+            appendLine()
+            appendLine("The consolidated batch PDF report for all registered employees is attached.")
         }
     }
 

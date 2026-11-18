@@ -24,8 +24,22 @@ data class LocalRegistrationInput(
     val name: String,
     val department: String = "Authorized Staff",
     val photoPath: String,
-    val faceSignature: String
+    val faceSignature: String,
+    val cnicPhotoPath: String = "",
+    val cnicNumber: String = "",
+    val cnicName: String = ""
 )
+
+data class BatchCycleStatus(
+    val dateKey: String,
+    val totalEnrolledCount: Int,
+    val completedEmployeeIds: Set<String>,
+    val incompleteEmployeeNames: List<String>
+) {
+    val completedCount: Int get() = completedEmployeeIds.size
+    val isMultiEmployeeMode: Boolean get() = totalEnrolledCount > 1
+    val allCompleted: Boolean get() = totalEnrolledCount > 0 && completedCount >= totalEnrolledCount
+}
 
 data class PendingCheckOutLock(
     val logId: String,
@@ -45,7 +59,10 @@ data class PendingCheckOutLock(
     val timeSource: String = "",
     val liveSelfiePath: String = "",
     val pdfReportPath: String = "",
-    val lockedAtMillis: Long = System.currentTimeMillis()
+    val lockedAtMillis: Long = System.currentTimeMillis(),
+    val isConsolidatedBatch: Boolean = false,
+    val batchDateKey: String = "",
+    val batchEmployeeCount: Int = 1
 )
 
 data class ServerLogMetadata(
@@ -105,12 +122,48 @@ class OfflineAttendanceStore(context: Context) {
     val isCheckOutEmailLocked: Boolean
         get() = _pendingCheckOutLock.value != null
 
-    fun hasRegisteredFaceProfiles(): Boolean {
-        return _employees.value.any { emp ->
+    fun getRegisteredBiometricEmployees(): List<Employee> {
+        return _employees.value.filter { emp ->
             emp.isActive &&
                 emp.faceSignature.isNotBlank() &&
                 FaceBiometricMatcher.parseSignature(emp.faceSignature) != null
         }
+    }
+
+    fun hasRegisteredFaceProfiles(): Boolean = getRegisteredBiometricEmployees().isNotEmpty()
+
+    fun getBatchCycleStatus(dateKey: String): BatchCycleStatus {
+        val enrolled = getRegisteredBiometricEmployees()
+        if (enrolled.isEmpty()) {
+            return BatchCycleStatus(
+                dateKey = dateKey,
+                totalEnrolledCount = 0,
+                completedEmployeeIds = emptySet(),
+                incompleteEmployeeNames = emptyList()
+            )
+        }
+        val completedIds = LinkedHashSet<String>()
+        val incompleteNames = mutableListOf<String>()
+        val dateLogs = _logs.value.filter { it.loggedDateKey == dateKey }
+        for (emp in enrolled) {
+            val empLogs = dateLogs.filter { log ->
+                (emp.id.isNotBlank() && log.employeeId == emp.id) ||
+                    (emp.employeeCode.isNotBlank() && log.employeeCode == emp.employeeCode)
+            }
+            val hasCheckIn = empLogs.any { it.eventType == AttendanceEventType.CHECK_IN.wireValue }
+            val hasCheckOut = empLogs.any { it.eventType == AttendanceEventType.CHECK_OUT.wireValue }
+            if (hasCheckIn && hasCheckOut) {
+                completedIds += emp.id
+            } else {
+                incompleteNames += emp.name
+            }
+        }
+        return BatchCycleStatus(
+            dateKey = dateKey,
+            totalEnrolledCount = enrolled.size,
+            completedEmployeeIds = completedIds,
+            incompleteEmployeeNames = incompleteNames
+        )
     }
 
     /**
@@ -163,6 +216,7 @@ class OfflineAttendanceStore(context: Context) {
             nextNum++
 
             val durablePhotoPath = persistRegisteredEmployeePhoto(empId, input.photoPath)
+            val durableCnicPath = persistRegisteredCnicPhoto(empId, input.cnicPhotoPath)
 
             val newEmployee = Employee(
                 id = empId,
@@ -176,7 +230,10 @@ class OfflineAttendanceStore(context: Context) {
                 isActive = true,
                 createdAt = Timestamp.now(),
                 updatedAt = Timestamp.now(),
-                localPhotoPath = durablePhotoPath
+                localPhotoPath = durablePhotoPath,
+                cnicNumber = input.cnicNumber.trim(),
+                cnicName = input.cnicName.trim().ifBlank { cleanName },
+                cnicPhotoPath = durableCnicPath
             )
             // Replace if same name already existed cleanly or append new
             updatedList.add(newEmployee)
@@ -220,6 +277,27 @@ class OfflineAttendanceStore(context: Context) {
         }
     }
 
+    private fun persistRegisteredCnicPhoto(employeeId: String, sourcePath: String): String {
+        if (sourcePath.isBlank()) return ""
+        val srcFile = File(sourcePath)
+        if (!srcFile.exists() || srcFile.length() <= 0L) return ""
+
+        return runCatching {
+            val dir = File(appContext.filesDir, "employee_cnic_photos").apply {
+                if (!exists()) mkdirs()
+            }
+            val safeId = employeeId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val destFile = File(dir, "${safeId}_cnic.jpg")
+            if (srcFile.absolutePath != destFile.absolutePath) {
+                srcFile.copyTo(destFile, overwrite = true)
+            }
+            destFile.absolutePath
+        }.getOrElse {
+            Log.w(TAG, "Failed to persist registered CNIC photo: ${it.message}")
+            sourcePath
+        }
+    }
+
     fun addEmployee(
         employeeCode: String,
         name: String,
@@ -230,10 +308,14 @@ class OfflineAttendanceStore(context: Context) {
         checkOutCode: String = "",
         avatarKey: String,
         faceSignature: String = "",
-        localPhotoPath: String = ""
+        localPhotoPath: String = "",
+        cnicNumber: String = "",
+        cnicName: String = "",
+        cnicPhotoPath: String = ""
     ): Employee {
         val empId = "emp_${UUID.randomUUID().toString().replace("-", "").take(16)}"
         val durablePhotoPath = persistRegisteredEmployeePhoto(empId, localPhotoPath)
+        val durableCnicPath = persistRegisteredCnicPhoto(empId, cnicPhotoPath)
         val newEmployee = Employee(
             id = empId,
             employeeCode = employeeCode.trim(),
@@ -248,7 +330,10 @@ class OfflineAttendanceStore(context: Context) {
             isActive = true,
             createdAt = Timestamp.now(),
             updatedAt = Timestamp.now(),
-            localPhotoPath = durablePhotoPath
+            localPhotoPath = durablePhotoPath,
+            cnicNumber = cnicNumber.trim(),
+            cnicName = cnicName.trim(),
+            cnicPhotoPath = durableCnicPath
         )
         val updated = (_employees.value + newEmployee).sortedBy { it.employeeCode }
         _employees.value = updated
@@ -273,6 +358,9 @@ class OfflineAttendanceStore(context: Context) {
         if (target != null && target.localPhotoPath.isNotBlank()) {
             runCatching { File(target.localPhotoPath).delete() }
         }
+        if (target != null && target.cnicPhotoPath.isNotBlank()) {
+            runCatching { File(target.cnicPhotoPath).delete() }
+        }
         val updated = _employees.value.filterNot { it.id == employeeId }
         _employees.value = updated
         persistEmployees(updated)
@@ -295,7 +383,9 @@ class OfflineAttendanceStore(context: Context) {
         explicitLogId: String? = null,
         gpsCoordinates: String = "",
         locationAddress: String = "",
-        timeSource: String = ""
+        timeSource: String = "",
+        matchedCnicName: String = "",
+        matchedCnicNumber: String = ""
     ): AttendanceLog {
         val logId = explicitLogId ?: "log_${UUID.randomUUID().toString().replace("-", "").take(20)}"
         val entry = AttendanceLog(
@@ -313,7 +403,9 @@ class OfflineAttendanceStore(context: Context) {
             gpsCoordinates = gpsCoordinates,
             locationAddress = locationAddress,
             timeSource = timeSource,
-            createdAt = Timestamp.now()
+            createdAt = Timestamp.now(),
+            matchedCnicName = matchedCnicName,
+            matchedCnicNumber = matchedCnicNumber
         )
         val updatedLogs = (listOf(entry) + _logs.value.filterNot { it.id == logId }).take(MAX_LOCAL_LOGS)
         _logs.value = updatedLogs
@@ -380,6 +472,54 @@ class OfflineAttendanceStore(context: Context) {
         val obj = JSONObject()
         trimmedEntries.forEach { (k, v) -> obj.put(k, v) }
         prefs.edit { putString(KEY_LOG_SELFIES_JSON, obj.toString()) }
+    }
+
+    fun persistCnicPhotoForLog(logId: String, sourcePath: String?): String? {
+        if (logId.isBlank() || sourcePath.isNullOrBlank()) return null
+        val srcFile = File(sourcePath)
+        if (!srcFile.exists() || srcFile.length() <= 0L) return null
+
+        val storedPath = runCatching {
+            val dir = File(appContext.filesDir, "attendance_cnic_photos").apply {
+                if (!exists()) mkdirs()
+            }
+            val safeId = logId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+            val destFile = File(dir, "${safeId}_cnic.jpg")
+            if (srcFile.absolutePath != destFile.absolutePath) {
+                srcFile.copyTo(destFile, overwrite = true)
+            }
+            dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(MAX_STORED_SELFIES)?.forEach { old ->
+                runCatching { old.delete() }
+            }
+            destFile.absolutePath
+        }.getOrElse { srcFile.absolutePath }
+
+        val map = getCnicPhotoPathsByLogId().toMutableMap()
+        map[logId] = storedPath
+        val trimmedEntries = map.entries.filter { File(it.value).exists() }.toList().takeLast(MAX_STORED_SELFIES)
+        val obj = JSONObject()
+        trimmedEntries.forEach { (k, v) -> obj.put(k, v) }
+        prefs.edit { putString(KEY_LOG_CNIC_PHOTOS_JSON, obj.toString()) }
+        return storedPath
+    }
+
+    fun getCnicPhotoPathsByLogId(): Map<String, String> {
+        val raw = prefs.getString(KEY_LOG_CNIC_PHOTOS_JSON, null) ?: return emptyMap()
+        return try {
+            val obj = JSONObject(raw)
+            val result = LinkedHashMap<String, String>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = obj.optString(k)
+                if (v.isNotBlank()) {
+                    result[k] = v
+                }
+            }
+            result
+        } catch (_: Exception) {
+            emptyMap()
+        }
     }
 
     fun markLogSynced(logId: String) {
@@ -617,9 +757,14 @@ class OfflineAttendanceStore(context: Context) {
         val byId = _employees.value.associateBy { it.id }.toMutableMap()
         remoteEmployees.forEach { remote ->
             if (remote.id !in pendingDeletes && remote.id !in pendingEdits) {
-                // Preserve localPhotoPath stored on this device
-                val localPhoto = byId[remote.id]?.localPhotoPath.orEmpty()
-                byId[remote.id] = remote.copy(localPhotoPath = localPhoto)
+                // Preserve localPhotoPath and cnicPhotoPath stored on this device
+                val existing = byId[remote.id]
+                val localPhoto = existing?.localPhotoPath.orEmpty()
+                val localCnicPhoto = existing?.cnicPhotoPath.orEmpty()
+                byId[remote.id] = remote.copy(
+                    localPhotoPath = localPhoto,
+                    cnicPhotoPath = localCnicPhoto
+                )
             }
         }
         val merged = byId.values.filterNot { it.id in pendingDeletes }.sortedBy { it.employeeCode }
@@ -676,7 +821,10 @@ class OfflineAttendanceStore(context: Context) {
                     avatarKey = obj.optString("avatarKey", "avatar_1"),
                     faceSignature = obj.optString("faceSignature"),
                     isActive = obj.optBoolean("isActive", true),
-                    localPhotoPath = obj.optString("localPhotoPath")
+                    localPhotoPath = obj.optString("localPhotoPath"),
+                    cnicNumber = obj.optString("cnicNumber"),
+                    cnicName = obj.optString("cnicName"),
+                    cnicPhotoPath = obj.optString("cnicPhotoPath")
                 )
             }
         } catch (_: Exception) {
@@ -702,6 +850,9 @@ class OfflineAttendanceStore(context: Context) {
                     put("faceSignature", emp.faceSignature)
                     put("isActive", emp.isActive)
                     put("localPhotoPath", emp.localPhotoPath)
+                    put("cnicNumber", emp.cnicNumber)
+                    put("cnicName", emp.cnicName)
+                    put("cnicPhotoPath", emp.cnicPhotoPath)
                 }
             )
         }
@@ -731,7 +882,9 @@ class OfflineAttendanceStore(context: Context) {
                     gpsCoordinates = obj.optString("gpsCoordinates"),
                     locationAddress = obj.optString("locationAddress"),
                     timeSource = obj.optString("timeSource"),
-                    createdAt = if (epochSec > 0L) Timestamp(epochSec, 0) else null
+                    createdAt = if (epochSec > 0L) Timestamp(epochSec, 0) else null,
+                    matchedCnicName = obj.optString("matchedCnicName"),
+                    matchedCnicNumber = obj.optString("matchedCnicNumber")
                 )
             }
         } catch (_: Exception) {
@@ -760,6 +913,8 @@ class OfflineAttendanceStore(context: Context) {
                     put("locationAddress", log.locationAddress)
                     put("timeSource", log.timeSource)
                     put("createdAtSec", log.createdAt?.seconds ?: (System.currentTimeMillis() / 1000L))
+                    put("matchedCnicName", log.matchedCnicName)
+                    put("matchedCnicNumber", log.matchedCnicNumber)
                 }
             )
         }
@@ -791,7 +946,10 @@ class OfflineAttendanceStore(context: Context) {
                 timeSource = obj.optString("timeSource"),
                 liveSelfiePath = obj.optString("liveSelfiePath"),
                 pdfReportPath = obj.optString("pdfReportPath"),
-                lockedAtMillis = obj.optLong("lockedAtMillis", System.currentTimeMillis())
+                lockedAtMillis = obj.optLong("lockedAtMillis", System.currentTimeMillis()),
+                isConsolidatedBatch = obj.optBoolean("isConsolidatedBatch", false),
+                batchDateKey = obj.optString("batchDateKey"),
+                batchEmployeeCount = obj.optInt("batchEmployeeCount", 1)
             )
         } catch (_: Exception) {
             null
@@ -818,6 +976,9 @@ class OfflineAttendanceStore(context: Context) {
             put("liveSelfiePath", lock.liveSelfiePath)
             put("pdfReportPath", lock.pdfReportPath)
             put("lockedAtMillis", lock.lockedAtMillis)
+            put("isConsolidatedBatch", lock.isConsolidatedBatch)
+            put("batchDateKey", lock.batchDateKey)
+            put("batchEmployeeCount", lock.batchEmployeeCount)
         }
         prefs.edit(commit = true) { putString(KEY_PENDING_CHECKOUT_LOCK_JSON, obj.toString()) }
     }
@@ -849,6 +1010,7 @@ class OfflineAttendanceStore(context: Context) {
         private const val KEY_PENDING_SERVER_EMAIL_REPORTS_JSON = "pending_server_email_reports_json"
         private const val KEY_LOG_SERVER_METADATA_JSON = "log_server_metadata_json"
         private const val KEY_LOG_SELFIES_JSON = "log_selfies_json"
+        private const val KEY_LOG_CNIC_PHOTOS_JSON = "log_cnic_photos_json"
         private const val KEY_REGISTRATION_COMPLETED = "local_registration_completed"
         private const val MAX_LOCAL_LOGS = 400
         private const val MAX_STORED_SELFIES = 80

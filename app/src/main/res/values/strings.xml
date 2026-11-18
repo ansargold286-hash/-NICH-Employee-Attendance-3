@@ -24,4 +24,10 @@
     <string name="pending_checkout_lock_message">Pending Check-Out email not sent! Please send the attendance report to proceed.</string>
     <string name="offline_lock_badge">Offline Lock Active • Live Photo, GPS &amp; PDF Saved</string>
     <string name="retry_send_checkout_email">Send Pending Email &amp; Unlock</string>
+    <string name="capture_face_and_cnic">Capture Face &amp; CNIC</string>
+    <string name="retake_face_and_cnic">Retake Face &amp; CNIC</string>
+    <string name="cnic_scan_step_title">Step B • Rear Camera CNIC Scan</string>
+    <string name="cnic_green_frame_hint">Hold CNIC Front Side inside the Green Guide Frame (Auto-Snap)</string>
+    <string name="batch_waiting_others_hint">All staff must complete Check-In &amp; Check-Out before sending the batch email.</string>
+    <string name="send_batch_email_and_finish">Send Batch PDF Email &amp; Finish</string>
 </resources>

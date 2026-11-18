@@ -133,20 +133,41 @@ object VoicePromptScript {
     fun unrecognizedFacePrompt(): String =
         "Face not recognized yet. Please step closer in clear lighting and look at the camera."
 
-    fun verificationPrompt(employeeName: String, eventType: AttendanceEventType): String {
+    fun switchToCnicStepPrompt(employeeName: String): String {
+        val spokenName = formatSpokenName(employeeName)
+        return "Face verified for $spokenName. Step 2: Hold your CNIC front side inside the green frame."
+    }
+
+    fun cnicMismatchPrompt(employeeName: String): String {
+        val spokenName = formatSpokenName(employeeName)
+        return "CNIC name does not match $spokenName. Please scan the correct employee's CNIC front side."
+    }
+
+    fun registrationSwitchToCnicPrompt(employeeIndex: Int): String =
+        "Face captured for employee $employeeIndex. Now hold their CNIC front side inside the green frame for auto capture."
+
+    fun verificationPrompt(
+        employeeName: String,
+        eventType: AttendanceEventType,
+        isBatchWaitingOthers: Boolean = false
+    ): String {
         val spokenName = formatSpokenName(employeeName)
         return when (eventType) {
             AttendanceEventType.CHECK_IN ->
-                "Welcome, $spokenName. Check-in recorded with verified liveness and GPS location."
+                "Welcome, $spokenName. Face and CNIC check-in confirmed with GPS location."
             AttendanceEventType.CHECK_OUT ->
-                "Check-out verified for $spokenName. Generating your PDF report with live capture and GPS location. Please send the email to save and finish your record."
+                if (isBatchWaitingOthers) {
+                    "Check-out confirmed for $spokenName via face and CNIC. Attendance saved locally. Consolidated batch email unlocks once all staff finish."
+                } else {
+                    "Check-out confirmed for $spokenName via face and CNIC. PDF report ready. Please send the email to save and finish your record."
+                }
         }
     }
 
     fun emailDispatchedPrompt(openedDeviceApp: Boolean): String = if (openedDeviceApp) {
-        "Opening email app to dispatch your check-out report."
+        "Opening email app to dispatch your attendance report."
     } else {
-        "Check-out email and weekly report sent successfully. Attendance saved."
+        "Attendance email and PDF report sent successfully. Terminal unlocked."
     }
 
     private fun formatSpokenName(rawName: String): String {

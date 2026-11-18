@@ -199,7 +199,9 @@ private fun StrictBiometricTerminalShell(
                     },
                     onResetTerminal = viewModel::resetToReady,
                     onAttemptSkipCheckOutEmail = viewModel::attemptSkipOrDismissCheckOut,
-                    networkTimeLabel = networkTimeStatus.sourceLabel
+                    networkTimeLabel = networkTimeStatus.sourceLabel,
+                    onCnicFrameAnalyzed = viewModel::onCnicFrameAnalyzed,
+                    onCancelCnicScan = viewModel::cancelCnicStepToFaceScan
                 )
             }
         }

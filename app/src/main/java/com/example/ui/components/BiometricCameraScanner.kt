@@ -95,9 +95,18 @@ import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.sin
 
+import com.example.data.model.CnicScanFrame
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+
 private val ScannerElectricBlue = Color(0xFF29B6F6)
 private val ScannerDeepBlue = Color(0xFF1E88E5)
 private val ScannerNodeBlue = Color(0xFF80D8FF)
+
+enum class BiometricScannerMode {
+    FRONT_FACE_LIVENESS,
+    REAR_CNIC_SCAN
+}
 
 @OptIn(ExperimentalGetImage::class)
 @Composable
@@ -107,7 +116,10 @@ fun BiometricCameraScanner(
     onCameraInitialized: () -> Unit,
     onCameraInitFailed: (String) -> Unit,
     onFrameAnalyzed: (FaceAnalysisFrame) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    scannerMode: BiometricScannerMode = BiometricScannerMode.FRONT_FACE_LIVENESS,
+    cnicAligned: Boolean = false,
+    onCnicFrameAnalyzed: (CnicScanFrame) -> Unit = {}
 ) {
     val context = LocalContext.current
     val appContext = context.applicationContext
@@ -120,12 +132,17 @@ fun BiometricCameraScanner(
     val latestCameraInit by rememberUpdatedState(onCameraInitialized)
     val latestCameraFail by rememberUpdatedState(onCameraInitFailed)
     val latestFrameAnalyzed by rememberUpdatedState(onFrameAnalyzed)
+    val latestCnicFrameAnalyzed by rememberUpdatedState(onCnicFrameAnalyzed)
 
     val activeDirectionRef = remember { AtomicReference(activeDirection) }
     activeDirectionRef.set(activeDirection)
+    val scannerModeRef = remember { AtomicReference(scannerMode) }
+    scannerModeRef.set(scannerMode)
     val isFrontCameraRef = remember { AtomicBoolean(true) }
     val lastSelfieWriteMs = remember { AtomicLong(0L) }
     val lastSelfiePathRef = remember { AtomicReference<String?>(null) }
+    val lastCnicWriteMs = remember { AtomicLong(0L) }
+    val lastCnicPathRef = remember { AtomicReference<String?>(null) }
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -191,12 +208,24 @@ fun BiometricCameraScanner(
                 FaceDetection.getClient(options)
             }
 
+            val textRecognizer = remember {
+                TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            }
+
+            DisposableEffect(Unit) {
+                onDispose {
+                    runCatching { faceDetector.close() }
+                    runCatching { textRecognizer.close() }
+                    runCatching { cameraExecutor.shutdown() }
+                }
+            }
+
             AndroidView(
                 factory = { previewView },
                 modifier = Modifier.fillMaxSize()
             )
 
-            DisposableEffect(lifecycleOwner, hasCameraPermission) {
+            DisposableEffect(lifecycleOwner, hasCameraPermission, scannerMode) {
                 var isDisposed = false
                 var boundProvider: ProcessCameraProvider? = null
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -222,48 +251,61 @@ fun BiometricCameraScanner(
                                     }
                                     val mediaImage = imageProxy.image
                                     if (mediaImage != null) {
-                                        val stepSnapshot = activeDirectionRef.get()
+                                        val modeSnapshot = scannerModeRef.get()
                                         val frontCam = isFrontCameraRef.get()
                                         val rotationDeg = imageProxy.imageInfo.rotationDegrees
 
-                                        if (stepSnapshot == LivenessDirection.CENTER_VERIFY || lastSelfiePathRef.get() == null) {
-                                            val nowMs = System.currentTimeMillis()
-                                            if (lastSelfiePathRef.get() == null || nowMs - lastSelfieWriteMs.get() >= 80L) {
-                                                val capturedPath = captureRotatedSelfieFile(
-                                                    context = appContext,
-                                                    imageProxy = imageProxy,
-                                                    isFrontCamera = frontCam,
-                                                    rotationDegrees = rotationDeg,
-                                                    maxKeepCount = 8
-                                                )
-                                                if (capturedPath != null) {
-                                                    lastSelfiePathRef.set(capturedPath)
-                                                    lastSelfieWriteMs.set(nowMs)
+                                        if (modeSnapshot == BiometricScannerMode.FRONT_FACE_LIVENESS) {
+                                            val stepSnapshot = activeDirectionRef.get()
+                                            if (stepSnapshot == LivenessDirection.CENTER_VERIFY || lastSelfiePathRef.get() == null) {
+                                                val nowMs = System.currentTimeMillis()
+                                                if (lastSelfiePathRef.get() == null || nowMs - lastSelfieWriteMs.get() >= 80L) {
+                                                    val capturedPath = captureRotatedSelfieFile(
+                                                        context = appContext,
+                                                        imageProxy = imageProxy,
+                                                        isFrontCamera = frontCam,
+                                                        rotationDegrees = rotationDeg,
+                                                        maxKeepCount = 8
+                                                    )
+                                                    if (capturedPath != null) {
+                                                        lastSelfiePathRef.set(capturedPath)
+                                                        lastSelfieWriteMs.set(nowMs)
+                                                    }
                                                 }
                                             }
-                                        }
 
-                                        val inputImage = InputImage.fromMediaImage(mediaImage, rotationDeg)
-                                        val selfieForFrame = lastSelfiePathRef.get()
+                                            val inputImage = InputImage.fromMediaImage(mediaImage, rotationDeg)
+                                            val selfieForFrame = lastSelfiePathRef.get()
 
-                                        faceDetector.process(inputImage)
-                                            .addOnSuccessListener { faces ->
-                                                if (!isDisposed) {
-                                                    val primaryFace = faces.maxByOrNull {
-                                                        it.boundingBox.width() * it.boundingBox.height()
-                                                    }
-                                                    if (primaryFace != null) {
-                                                        latestFrameAnalyzed(
-                                                            analyzeFaceBiometrics(
-                                                                face = primaryFace,
-                                                                targetDirection = activeDirectionRef.get(),
-                                                                isFrontCamera = frontCam,
-                                                                capturedSelfiePath = selfieForFrame,
-                                                                frameWidth = inputImage.width,
-                                                                frameHeight = inputImage.height
+                                            faceDetector.process(inputImage)
+                                                .addOnSuccessListener { faces ->
+                                                    if (!isDisposed && scannerModeRef.get() == BiometricScannerMode.FRONT_FACE_LIVENESS) {
+                                                        val primaryFace = faces.maxByOrNull {
+                                                            it.boundingBox.width() * it.boundingBox.height()
+                                                        }
+                                                        if (primaryFace != null) {
+                                                            latestFrameAnalyzed(
+                                                                analyzeFaceBiometrics(
+                                                                    face = primaryFace,
+                                                                    targetDirection = activeDirectionRef.get(),
+                                                                    isFrontCamera = frontCam,
+                                                                    capturedSelfiePath = selfieForFrame,
+                                                                    frameWidth = inputImage.width,
+                                                                    frameHeight = inputImage.height
+                                                                )
                                                             )
-                                                        )
-                                                    } else {
+                                                        } else {
+                                                            latestFrameAnalyzed(
+                                                                FaceAnalysisFrame(
+                                                                    faceDetected = false,
+                                                                    isFrontCamera = frontCam
+                                                                )
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                                .addOnFailureListener {
+                                                    if (!isDisposed && scannerModeRef.get() == BiometricScannerMode.FRONT_FACE_LIVENESS) {
                                                         latestFrameAnalyzed(
                                                             FaceAnalysisFrame(
                                                                 faceDetected = false,
@@ -272,20 +314,74 @@ fun BiometricCameraScanner(
                                                         )
                                                     }
                                                 }
-                                            }
-                                            .addOnFailureListener {
-                                                if (!isDisposed) {
-                                                    latestFrameAnalyzed(
-                                                        FaceAnalysisFrame(
-                                                            faceDetected = false,
-                                                            isFrontCamera = frontCam
-                                                        )
-                                                    )
+                                                .addOnCompleteListener {
+                                                    imageProxy.close()
+                                                }
+                                        } else {
+                                            // Step B: Rear-Camera Live CNIC OCR Scanning + Auto-Snap inside Green Guide Frame
+                                            val nowMs = System.currentTimeMillis()
+                                            if (lastCnicPathRef.get() == null || nowMs - lastCnicWriteMs.get() >= 150L) {
+                                                val cnicSnap = captureRotatedCnicCardFile(
+                                                    context = appContext,
+                                                    imageProxy = imageProxy,
+                                                    isFrontCamera = frontCam,
+                                                    rotationDegrees = rotationDeg,
+                                                    targetDirName = "live_cnic_captures",
+                                                    filePrefix = "daily_cnic",
+                                                    maxKeepCount = 4
+                                                )
+                                                if (cnicSnap != null) {
+                                                    lastCnicPathRef.set(cnicSnap)
+                                                    lastCnicWriteMs.set(nowMs)
                                                 }
                                             }
-                                            .addOnCompleteListener {
-                                                imageProxy.close()
-                                            }
+
+                                            val inputImage = InputImage.fromMediaImage(mediaImage, rotationDeg)
+                                            val cnicPhotoForFrame = lastCnicPathRef.get()
+
+                                            textRecognizer.process(inputImage)
+                                                .addOnSuccessListener { visionText ->
+                                                    if (!isDisposed && scannerModeRef.get() == BiometricScannerMode.REAR_CNIC_SCAN) {
+                                                        val (insideGreen, parsed) = evaluateVisionTextInGreenFrame(
+                                                            visionText = visionText,
+                                                            imageWidth = inputImage.width,
+                                                            imageHeight = inputImage.height,
+                                                            rotationDegrees = rotationDeg
+                                                        )
+                                                        latestCnicFrameAnalyzed(
+                                                            CnicScanFrame(
+                                                                cardDetected = parsed.isCnicCardDetected,
+                                                                insideGreenFrame = insideGreen,
+                                                                rawOcrText = parsed.rawText,
+                                                                extractedName = parsed.extractedName,
+                                                                cnicNumber = parsed.cnicNumber,
+                                                                cnicImagePath = cnicPhotoForFrame,
+                                                                isRearCamera = !frontCam,
+                                                                qualityIssue = when {
+                                                                    !insideGreen -> "Align CNIC Front Side inside the Green Guide Frame"
+                                                                    !parsed.isCnicCardDetected -> "Move CNIC closer so Name & CNIC Number are legible"
+                                                                    else -> null
+                                                                }
+                                                            )
+                                                        )
+                                                    }
+                                                }
+                                                .addOnFailureListener {
+                                                    if (!isDisposed && scannerModeRef.get() == BiometricScannerMode.REAR_CNIC_SCAN) {
+                                                        latestCnicFrameAnalyzed(
+                                                            CnicScanFrame(
+                                                                cardDetected = false,
+                                                                insideGreenFrame = false,
+                                                                isRearCamera = !frontCam,
+                                                                qualityIssue = "Hold CNIC steady inside the Green Guide Frame"
+                                                            )
+                                                        )
+                                                    }
+                                                }
+                                                .addOnCompleteListener {
+                                                    imageProxy.close()
+                                                }
+                                        }
                                     } else {
                                         imageProxy.close()
                                     }
@@ -294,16 +390,30 @@ fun BiometricCameraScanner(
 
                         val hasFront = cameraProvider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)
                         val hasBack = cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)
-                        val selector = when {
-                            hasFront -> {
-                                isFrontCameraRef.set(true)
-                                CameraSelector.DEFAULT_FRONT_CAMERA
+                        val selector = if (scannerMode == BiometricScannerMode.FRONT_FACE_LIVENESS) {
+                            when {
+                                hasFront -> {
+                                    isFrontCameraRef.set(true)
+                                    CameraSelector.DEFAULT_FRONT_CAMERA
+                                }
+                                hasBack -> {
+                                    isFrontCameraRef.set(false)
+                                    CameraSelector.DEFAULT_BACK_CAMERA
+                                }
+                                else -> null
                             }
-                            hasBack -> {
-                                isFrontCameraRef.set(false)
-                                CameraSelector.DEFAULT_BACK_CAMERA
+                        } else {
+                            when {
+                                hasBack -> {
+                                    isFrontCameraRef.set(false)
+                                    CameraSelector.DEFAULT_BACK_CAMERA
+                                }
+                                hasFront -> {
+                                    isFrontCameraRef.set(true)
+                                    CameraSelector.DEFAULT_FRONT_CAMERA
+                                }
+                                else -> null
                             }
-                            else -> null
                         }
 
                         if (selector == null) {
@@ -334,8 +444,6 @@ fun BiometricCameraScanner(
                 onDispose {
                     isDisposed = true
                     runCatching { boundProvider?.unbindAll() }
-                    runCatching { faceDetector.close() }
-                    runCatching { cameraExecutor.shutdown() }
                 }
             }
         } else {
@@ -377,12 +485,19 @@ fun BiometricCameraScanner(
             }
         }
 
-        // Central Precision Blue Boundary-Box + Continuous 3D Blue Geometric Scanning Overlay
+        // Mode-aware Overlay: Blue 3D Facial Mesh (Step A) vs Green CNIC Guide Frame (Step B)
         Canvas(modifier = Modifier.fillMaxSize()) {
-            drawStandaloneTerminalScannerOverlay(
-                sweepFraction = sweepFraction,
-                meshPulse = meshPulse
-            )
+            if (scannerMode == BiometricScannerMode.FRONT_FACE_LIVENESS) {
+                drawStandaloneTerminalScannerOverlay(
+                    sweepFraction = sweepFraction,
+                    meshPulse = meshPulse
+                )
+            } else {
+                drawGreenCnicGuideFrame(
+                    isAligned = cnicAligned,
+                    sweepFraction = sweepFraction
+                )
+            }
         }
 
         // Only visible branding element: NICH Employee Attendance 3 app icon cleanly in bottom corner
