@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.local.LocalRegistrationInput
 import com.example.data.local.OfflineAttendanceStore
 import com.example.data.local.PendingCheckOutLock
+import com.example.data.local.PendingServerEmailReport
 import com.example.data.location.LocationAddressProvider
 import com.example.data.location.NoOpLocationAddressProvider
 import com.example.data.model.AntiSpoofingLivenessTracker
@@ -19,6 +20,7 @@ import com.example.data.model.FaceBiometricMatcher
 import com.example.data.model.LivenessDirection
 import com.example.data.model.LivenessEvaluator
 import com.example.data.model.VerificationMethod
+import com.example.data.remote.ServerSyncClient
 import com.example.data.report.AttendanceEmailReporter
 import com.example.data.report.EmailReportStatus
 import com.example.data.repository.AttendanceRepository
@@ -125,7 +127,8 @@ class AttendanceViewModel(
     private val sameEmployeeCooldownMs: Long = 3_000L,
     private val voiceSpeaker: VoiceSpeaker = NoOpVoiceSpeaker,
     private val networkTimeProvider: NetworkTimeProvider? = null,
-    private val locationProvider: LocationAddressProvider = NoOpLocationAddressProvider
+    private val locationProvider: LocationAddressProvider = NoOpLocationAddressProvider,
+    private val serverSyncClient: ServerSyncClient? = null
 ) : ViewModel() {
 
     val employeesState: StateFlow<DataUiState<List<Employee>>> =
@@ -249,6 +252,8 @@ class AttendanceViewModel(
                     retryPendingEmailReports()
                 }
             }
+
+            triggerServerSyncAsync()
 
             viewModelScope.launch {
                 while (isActive) {
@@ -471,6 +476,12 @@ class AttendanceViewModel(
             )
             if (outcome == EmailReportStatus.SENT) {
                 offlineStore.clearPendingCheckOutLock(logId)
+                recordServerEmailEvent(
+                    log = log,
+                    employee = employee,
+                    dispatchStatus = EmailReportStatus.SENT.name,
+                    pdfFileName = "NICH_${employee.employeeCode}_${log.loggedDateKey}.pdf"
+                )
                 val activeVerified = _terminalPhase.value as? TerminalUiPhase.Verified
                 if (activeVerified != null && activeVerified.logId == logId && activeVerified.isPersistentLock) {
                     _terminalPhase.update { phase ->
@@ -491,6 +502,7 @@ class AttendanceViewModel(
                 }
             }
         }
+        triggerServerSyncAsync()
     }
 
     fun openRegistrationScreen() {
@@ -529,6 +541,7 @@ class AttendanceViewModel(
                 }
             }
         }
+        triggerServerSyncAsync()
         closeRegistrationScreen()
     }
 
@@ -900,6 +913,19 @@ class AttendanceViewModel(
         val durableSelfiePath = offlineStore.persistSelfieForLog(localEntry.id, liveSelfiePath)
             ?: liveSelfiePath
 
+        val initialEmailStatus = if (eventType == AttendanceEventType.CHECK_IN) {
+            "NOT_APPLICABLE"
+        } else {
+            "PENDING"
+        }
+        offlineStore.markServerEmployeePending(employee.id)
+        offlineStore.markServerLogPending(
+            logId = localEntry.id,
+            ntpEpochMillis = networkSnapshot.epochMillis,
+            emailDispatchStatus = initialEmailStatus
+        )
+        triggerServerSyncAsync()
+
         val senderAccount = emailReporter?.resolveSenderAccountEmail()
         emailReminderJob?.cancel()
 
@@ -1182,8 +1208,21 @@ class AttendanceViewModel(
                 )
                 if (outcome == EmailReportStatus.SENT) {
                     offlineStore.clearPendingCheckOutLock(matchingLog.id)
+                    recordServerEmailEvent(
+                        log = matchingLog,
+                        employee = current.employee,
+                        dispatchStatus = EmailReportStatus.SENT.name,
+                        pdfFileName = current.pdfReportPath.substringAfterLast('/')
+                    )
                     retryPendingEmailReports()
                     dispatchedViaSmtp = true
+                } else {
+                    recordServerEmailEvent(
+                        log = matchingLog,
+                        employee = current.employee,
+                        dispatchStatus = outcome.name,
+                        pdfFileName = current.pdfReportPath.substringAfterLast('/')
+                    )
                 }
             } else {
                 runCatching {
@@ -1212,12 +1251,19 @@ class AttendanceViewModel(
                         syncedToCloud = current.syncedToCloud
                     )
                     offlineStore.clearPendingCheckOutLock(matchingLog.id)
+                    recordServerEmailEvent(
+                        log = matchingLog,
+                        employee = current.employee,
+                        dispatchStatus = "DEVICE_GMAIL_INTENT",
+                        pdfFileName = pdfFile.name
+                    )
                     onLaunchEmailIntent(gmailIntent)
                     openedDeviceShare = true
                 }.onFailure { err ->
                     Log.w(TAG, "Failed to launch Gmail share intent: ${err.message}")
                 }
             }
+            triggerServerSyncAsync()
 
             if (dispatchedViaSmtp || openedDeviceShare) {
                 _terminalPhase.update { phase ->
@@ -1356,6 +1402,13 @@ class AttendanceViewModel(
                     flush = false
                 )
             }
+            recordServerEmailEvent(
+                log = log,
+                employee = employee,
+                dispatchStatus = outcome.name,
+                pdfFileName = "NICH_${employee.employeeCode}_${log.loggedDateKey}.pdf"
+            )
+            triggerServerSyncAsync()
             val lockFailedCheckOut = outcome != EmailReportStatus.SENT && eventType == AttendanceEventType.CHECK_OUT
             _terminalPhase.update { current ->
                 if (current is TerminalUiPhase.Verified && current.logId == log.id) {
@@ -1383,6 +1436,48 @@ class AttendanceViewModel(
             }
             if (rescheduleResetAfter && outcome == EmailReportStatus.SENT) {
                 scheduleAutoResetToReady()
+            }
+        }
+    }
+
+    private fun recordServerEmailEvent(
+        log: AttendanceLog,
+        employee: Employee,
+        dispatchStatus: String,
+        pdfFileName: String
+    ) {
+        offlineStore.updateServerLogEmailStatus(log.id, dispatchStatus)
+        if (log.eventType == AttendanceEventType.CHECK_OUT.wireValue) {
+            val meta = offlineStore.getServerLogMetadata(log.id)
+            offlineStore.enqueueServerEmailReport(
+                PendingServerEmailReport(
+                    reportId = "email_${log.id}",
+                    logId = log.id,
+                    employeeId = employee.id,
+                    employeeCode = employee.employeeCode,
+                    employeeName = employee.name,
+                    department = employee.department,
+                    eventType = log.eventType,
+                    recipientEmail = AttendanceEmailReporter.TARGET_RECIPIENT_EMAIL,
+                    dispatchStatus = dispatchStatus,
+                    pdfFileName = pdfFileName,
+                    gpsCoordinates = log.gpsCoordinates,
+                    locationAddress = log.locationAddress,
+                    timeSource = log.timeSource,
+                    ntpEpochMillis = meta.ntpEpochMillis
+                )
+            )
+        }
+    }
+
+    private fun triggerServerSyncAsync() {
+        val client = serverSyncClient ?: return
+        if (!client.isConfigured()) return
+        viewModelScope.launch {
+            runCatching {
+                client.flushPending(offlineStore, currentUserId)
+            }.onFailure { err ->
+                Log.w(TAG, "Background server sync deferred: ${err.message}")
             }
         }
     }

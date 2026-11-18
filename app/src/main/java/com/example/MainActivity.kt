@@ -26,6 +26,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.data.local.OfflineAttendanceStore
 import com.example.data.location.AndroidLocationAddressProvider
+import com.example.data.remote.ServerSyncClient
 import com.example.data.report.AttendanceEmailReporter
 import com.example.data.repository.AttendanceRepository
 import com.example.data.time.SntpNetworkTimeProvider
@@ -143,6 +144,7 @@ private fun StrictBiometricTerminalShell(
                 val voiceAssistant = AndroidVoiceAssistant(app)
                 val networkTimeProvider = SntpNetworkTimeProvider()
                 val locationProvider = AndroidLocationAddressProvider(app)
+                val serverSyncClient = ServerSyncClient()
                 AttendanceViewModel(
                     offlineStore = offlineStore,
                     repository = cloudRepository,
@@ -150,7 +152,8 @@ private fun StrictBiometricTerminalShell(
                     emailReporter = emailReporter,
                     voiceSpeaker = voiceAssistant,
                     networkTimeProvider = networkTimeProvider,
-                    locationProvider = locationProvider
+                    locationProvider = locationProvider,
+                    serverSyncClient = serverSyncClient
                 )
             }
         }

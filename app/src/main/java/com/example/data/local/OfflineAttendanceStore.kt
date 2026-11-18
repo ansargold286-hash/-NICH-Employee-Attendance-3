@@ -48,6 +48,29 @@ data class PendingCheckOutLock(
     val lockedAtMillis: Long = System.currentTimeMillis()
 )
 
+data class ServerLogMetadata(
+    val ntpEpochMillis: Long = 0L,
+    val emailDispatchStatus: String = ""
+)
+
+data class PendingServerEmailReport(
+    val reportId: String,
+    val logId: String,
+    val employeeId: String,
+    val employeeCode: String,
+    val employeeName: String,
+    val department: String,
+    val eventType: String,
+    val recipientEmail: String,
+    val dispatchStatus: String,
+    val pdfFileName: String = "",
+    val gpsCoordinates: String = "",
+    val locationAddress: String = "",
+    val timeSource: String = "",
+    val ntpEpochMillis: Long = 0L,
+    val dispatchedAtEpochMs: Long = System.currentTimeMillis()
+)
+
 class OfflineAttendanceStore(context: Context) {
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -72,6 +95,12 @@ class OfflineAttendanceStore(context: Context) {
 
     private val _pendingCheckOutLock = MutableStateFlow(loadPendingCheckOutLock())
     val pendingCheckOutLock: StateFlow<PendingCheckOutLock?> = _pendingCheckOutLock.asStateFlow()
+
+    private val _pendingServerLogIds = MutableStateFlow(loadStringSet(KEY_PENDING_SERVER_LOG_IDS))
+    val pendingServerLogIds: StateFlow<Set<String>> = _pendingServerLogIds.asStateFlow()
+
+    private val _pendingServerEmployeeIds = MutableStateFlow(loadStringSet(KEY_PENDING_SERVER_EMPLOYEE_IDS))
+    val pendingServerEmployeeIds: StateFlow<Set<String>> = _pendingServerEmployeeIds.asStateFlow()
 
     val isCheckOutEmailLocked: Boolean
         get() = _pendingCheckOutLock.value != null
@@ -153,6 +182,7 @@ class OfflineAttendanceStore(context: Context) {
             updatedList.add(newEmployee)
             createdList.add(newEmployee)
             markEmployeePendingSync(empId)
+            markServerEmployeePending(empId)
         }
 
         val sorted = updatedList.sortedBy { it.employeeCode }
@@ -224,6 +254,7 @@ class OfflineAttendanceStore(context: Context) {
         _employees.value = updated
         persistEmployees(updated)
         markEmployeePendingSync(newEmployee.id)
+        markServerEmployeePending(newEmployee.id)
         return newEmployee
     }
 
@@ -234,6 +265,7 @@ class OfflineAttendanceStore(context: Context) {
         _employees.value = updated
         persistEmployees(updated)
         markEmployeePendingSync(employee.id)
+        markServerEmployeePending(employee.id)
     }
 
     fun deleteEmployee(employeeId: String, queueCloudDelete: Boolean = true) {
@@ -422,6 +454,160 @@ class OfflineAttendanceStore(context: Context) {
             _pendingEmailLogIds.value = updated
             persistStringSetSync(KEY_PENDING_EMAIL_LOG_IDS, updated)
         }
+    }
+
+    fun markServerEmployeePending(employeeId: String) {
+        if (employeeId.isBlank() || employeeId in _pendingServerEmployeeIds.value) return
+        val updated = _pendingServerEmployeeIds.value + employeeId
+        _pendingServerEmployeeIds.value = updated
+        persistStringSet(KEY_PENDING_SERVER_EMPLOYEE_IDS, updated)
+    }
+
+    fun markServerEmployeeSynced(employeeId: String) {
+        if (employeeId !in _pendingServerEmployeeIds.value) return
+        val updated = _pendingServerEmployeeIds.value - employeeId
+        _pendingServerEmployeeIds.value = updated
+        persistStringSet(KEY_PENDING_SERVER_EMPLOYEE_IDS, updated)
+    }
+
+    fun markServerLogPending(
+        logId: String,
+        ntpEpochMillis: Long = 0L,
+        emailDispatchStatus: String = ""
+    ) {
+        if (logId.isBlank()) return
+        if (ntpEpochMillis > 0L || emailDispatchStatus.isNotBlank()) {
+            val map = loadServerMetadataMap().toMutableMap()
+            val prev = map[logId] ?: ServerLogMetadata()
+            map[logId] = ServerLogMetadata(
+                ntpEpochMillis = if (ntpEpochMillis > 0L) ntpEpochMillis else prev.ntpEpochMillis,
+                emailDispatchStatus = emailDispatchStatus.ifBlank { prev.emailDispatchStatus }
+            )
+            persistServerMetadataMap(map)
+        }
+        if (logId !in _pendingServerLogIds.value) {
+            val updated = _pendingServerLogIds.value + logId
+            _pendingServerLogIds.value = updated
+            persistStringSet(KEY_PENDING_SERVER_LOG_IDS, updated)
+        }
+    }
+
+    fun updateServerLogEmailStatus(logId: String, emailDispatchStatus: String) {
+        if (logId.isBlank() || emailDispatchStatus.isBlank()) return
+        markServerLogPending(logId = logId, emailDispatchStatus = emailDispatchStatus)
+    }
+
+    fun markServerLogSynced(logId: String) {
+        if (logId !in _pendingServerLogIds.value) return
+        val updated = _pendingServerLogIds.value - logId
+        _pendingServerLogIds.value = updated
+        persistStringSet(KEY_PENDING_SERVER_LOG_IDS, updated)
+    }
+
+    fun getServerLogMetadata(logId: String): ServerLogMetadata {
+        return loadServerMetadataMap()[logId] ?: ServerLogMetadata()
+    }
+
+    fun enqueueServerEmailReport(report: PendingServerEmailReport) {
+        if (report.reportId.isBlank()) return
+        val current = getPendingServerEmailReports()
+            .filterNot { it.reportId == report.reportId }
+        val updated = (current + report).takeLast(MAX_LOCAL_LOGS)
+        persistPendingServerEmailReports(updated)
+    }
+
+    fun getPendingServerEmailReports(): List<PendingServerEmailReport> {
+        val raw = prefs.getString(KEY_PENDING_SERVER_EMAIL_REPORTS_JSON, null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { idx ->
+                val obj = arr.getJSONObject(idx)
+                PendingServerEmailReport(
+                    reportId = obj.optString("reportId"),
+                    logId = obj.optString("logId"),
+                    employeeId = obj.optString("employeeId"),
+                    employeeCode = obj.optString("employeeCode"),
+                    employeeName = obj.optString("employeeName"),
+                    department = obj.optString("department"),
+                    eventType = obj.optString("eventType"),
+                    recipientEmail = obj.optString("recipientEmail"),
+                    dispatchStatus = obj.optString("dispatchStatus"),
+                    pdfFileName = obj.optString("pdfFileName"),
+                    gpsCoordinates = obj.optString("gpsCoordinates"),
+                    locationAddress = obj.optString("locationAddress"),
+                    timeSource = obj.optString("timeSource"),
+                    ntpEpochMillis = obj.optLong("ntpEpochMillis", 0L),
+                    dispatchedAtEpochMs = obj.optLong("dispatchedAtEpochMs", System.currentTimeMillis())
+                )
+            }.filter { it.reportId.isNotBlank() }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun markServerEmailReportSynced(reportId: String) {
+        val remaining = getPendingServerEmailReports().filterNot { it.reportId == reportId }
+        persistPendingServerEmailReports(remaining)
+    }
+
+    private fun loadServerMetadataMap(): Map<String, ServerLogMetadata> {
+        val raw = prefs.getString(KEY_LOG_SERVER_METADATA_JSON, null) ?: return emptyMap()
+        return try {
+            val obj = JSONObject(raw)
+            val result = LinkedHashMap<String, ServerLogMetadata>()
+            val keys = obj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val inner = obj.optJSONObject(k) ?: continue
+                result[k] = ServerLogMetadata(
+                    ntpEpochMillis = inner.optLong("ntpEpochMillis", 0L),
+                    emailDispatchStatus = inner.optString("emailDispatchStatus")
+                )
+            }
+            result
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    private fun persistServerMetadataMap(map: Map<String, ServerLogMetadata>) {
+        val obj = JSONObject()
+        map.entries.toList().takeLast(MAX_LOCAL_LOGS).forEach { (k, v) ->
+            obj.put(
+                k,
+                JSONObject().apply {
+                    put("ntpEpochMillis", v.ntpEpochMillis)
+                    put("emailDispatchStatus", v.emailDispatchStatus)
+                }
+            )
+        }
+        prefs.edit { putString(KEY_LOG_SERVER_METADATA_JSON, obj.toString()) }
+    }
+
+    private fun persistPendingServerEmailReports(list: List<PendingServerEmailReport>) {
+        val arr = JSONArray()
+        list.forEach { r ->
+            arr.put(
+                JSONObject().apply {
+                    put("reportId", r.reportId)
+                    put("logId", r.logId)
+                    put("employeeId", r.employeeId)
+                    put("employeeCode", r.employeeCode)
+                    put("employeeName", r.employeeName)
+                    put("department", r.department)
+                    put("eventType", r.eventType)
+                    put("recipientEmail", r.recipientEmail)
+                    put("dispatchStatus", r.dispatchStatus)
+                    put("pdfFileName", r.pdfFileName)
+                    put("gpsCoordinates", r.gpsCoordinates)
+                    put("locationAddress", r.locationAddress)
+                    put("timeSource", r.timeSource)
+                    put("ntpEpochMillis", r.ntpEpochMillis)
+                    put("dispatchedAtEpochMs", r.dispatchedAtEpochMs)
+                }
+            )
+        }
+        prefs.edit { putString(KEY_PENDING_SERVER_EMAIL_REPORTS_JSON, arr.toString()) }
     }
 
     fun mergeRemoteEmployees(remoteEmployees: List<Employee>) {
@@ -658,6 +844,10 @@ class OfflineAttendanceStore(context: Context) {
         private const val KEY_PENDING_DELETE_EMPLOYEE_IDS = "pending_delete_employee_ids"
         private const val KEY_PENDING_EMAIL_LOG_IDS = "pending_email_log_ids"
         private const val KEY_PENDING_CHECKOUT_LOCK_JSON = "pending_checkout_lock_json"
+        private const val KEY_PENDING_SERVER_LOG_IDS = "pending_server_log_ids"
+        private const val KEY_PENDING_SERVER_EMPLOYEE_IDS = "pending_server_employee_ids"
+        private const val KEY_PENDING_SERVER_EMAIL_REPORTS_JSON = "pending_server_email_reports_json"
+        private const val KEY_LOG_SERVER_METADATA_JSON = "log_server_metadata_json"
         private const val KEY_LOG_SELFIES_JSON = "log_selfies_json"
         private const val KEY_REGISTRATION_COMPLETED = "local_registration_completed"
         private const val MAX_LOCAL_LOGS = 400

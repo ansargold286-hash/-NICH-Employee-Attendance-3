@@ -7,6 +7,7 @@ import {
 } from './biometric-matcher.js';
 import { createFirebaseSyncClient } from './firebase-adapter.js';
 import { dispatchCheckOutEmailAndPdf } from './pdf-report.js';
+import { createServerSyncClient } from './server-sync.js';
 
 const VERIFIED_CHECK_IN_RESET_MS = 2500;
 const SAME_EMPLOYEE_COOLDOWN_MS = 3000;
@@ -52,6 +53,7 @@ const els = {
 
 const store = createWebAttendanceStore();
 const firebaseClient = createFirebaseSyncClient();
+const serverSyncClient = createServerSyncClient();
 const faceAnalyzer = createBrowserFaceAnalyzer();
 const overlayController = startScannerOverlayLoop(els.overlayCanvas);
 
@@ -255,6 +257,18 @@ async function commitVerifiedAttendance(employee, confidenceScore, selfieDataUrl
         console.warn('Background Firestore log sync deferred:', err);
       });
   }
+
+  serverSyncClient
+    .syncAttendancePayload({
+      employee,
+      logEntry,
+      selfieDataUrl,
+      emailDispatchStatus: eventType === 'CHECK_IN' ? 'NOT_APPLICABLE' : 'PENDING',
+      operatorUid: uid || null
+    })
+    .catch((err) => {
+      console.warn('Background server sync deferred:', err);
+    });
 
   // Check-In: NO email button, auto-return to live scanning after 2.5s
   // Check-Out: KEEP overlay strictly locked with Send Email & Finish + repeating enforcement voice
@@ -492,9 +506,34 @@ els.sendEmailFinishBtn.addEventListener('click', async () => {
     });
     store.clearPendingCheckOutLock();
     state.checkOutEmailCompleted = true;
+    serverSyncClient
+      .syncAttendancePayload({
+        employee: payload.employee,
+        logEntry: payload.logEntry,
+        selfieDataUrl: payload.selfieDataUrl,
+        emailDispatchStatus: 'SENT',
+        operatorUid: state.currentUser?.uid || null
+      })
+      .then(() =>
+        serverSyncClient.syncEmailReport({
+          employee: payload.employee,
+          logEntry: payload.logEntry,
+          dispatchStatus: 'SENT',
+          operatorUid: state.currentUser?.uid || null
+        })
+      )
+      .catch(() => {});
     speakWebVoicePrompt('Check-out email and report sent successfully. Attendance saved.', true);
     resetToScanning();
   } catch {
+    serverSyncClient
+      .syncEmailReport({
+        employee: payload.employee,
+        logEntry: payload.logEntry,
+        dispatchStatus: 'QUEUED_OFFLINE',
+        operatorUid: state.currentUser?.uid || null
+      })
+      .catch(() => {});
     els.sendEmailFinishBtn.disabled = false;
     els.sendEmailBtnLabel.textContent = payload.isPersistentLock
       ? 'Send Pending Email & Unlock'
@@ -564,3 +603,4 @@ window.addEventListener('pagehide', stopCameraFeed);
 refreshOperatorDrawer();
 startCameraFeed();
 restorePendingWebCheckOutLock(true);
+serverSyncClient.flushQueue().catch(() => {});
