@@ -11,6 +11,8 @@ jobs:
   build-debug-apk:
     name: Test & Build Debug APK
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -25,10 +27,12 @@ jobs:
       - name: Prepare debug signing keystore
         run: |
           if [ -n "${{ secrets.DEBUG_KEYSTORE_BASE64 }}" ]; then
-            echo "${{ secrets.DEBUG_KEYSTORE_BASE64 }}" | base64 -d > debug.keystore
+            printf '%s' "${{ secrets.DEBUG_KEYSTORE_BASE64 }}" | tr -d '\r\n ' | base64 -d > debug.keystore
           elif [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
-          elif [ ! -f debug.keystore ]; then
+            tr -d '\r\n ' < debug.keystore.base64 | base64 -d > debug.keystore
+          fi
+          if [ ! -s debug.keystore ] || ! keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey >/dev/null 2>&1; then
+            rm -f debug.keystore
             keytool -genkeypair -v \
               -keystore debug.keystore \
               -storepass android \
@@ -39,6 +43,7 @@ jobs:
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
           fi
+          keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey
 
       - name: Ensure Secrets Gradle .env exists
         run: |
@@ -63,8 +68,9 @@ jobs:
 
       - name: Accept Android SDK licenses
         run: |
-          if [ -n "${ANDROID_HOME:-}" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
-            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -n "$SDK_DIR" ] && [ -x "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           fi
 
       - name: Set up Gradle 9.3.1
@@ -78,12 +84,67 @@ jobs:
       - name: Assemble Debug APK
         run: gradle :app:assembleDebug --stacktrace
 
-      - name: Verify Debug APK artifact
-        run: ls -lh app/build/outputs/apk/debug/app-debug.apk
+      - name: Verify APK Signature, Alignment & Package Clean Archive
+        run: |
+          APK_SRC="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK_SRC"
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          BUILD_TOOLS_DIR="$SDK_DIR/build-tools/$(ls "$SDK_DIR/build-tools" | sort -V | tail -n1)"
+
+          "$BUILD_TOOLS_DIR/zipalign" -c -v 4 "$APK_SRC" | tail -n 10
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "$APK_SRC"
+          "$BUILD_TOOLS_DIR/aapt2" dump badging "$APK_SRC" | head -n 10
+          unzip -tq "$APK_SRC"
+
+          VERSION_NAME="$(grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/' || echo '2.0')"
+          APK_NAME="NICH-Attendance-3-v${VERSION_NAME}-debug.apk"
+          ZIP_NAME="NICH-Attendance-3-v${VERSION_NAME}-debug-apk.zip"
+
+          rm -rf dist
+          mkdir -p dist
+          cp "$APK_SRC" "dist/$APK_NAME"
+
+          # Create a standard PKZIP 2.0 deflate archive (no ZIP64 streaming descriptors)
+          # so built-in Android & Windows extractors open it cleanly without corruption errors.
+          zip -j -6 "dist/$ZIP_NAME" "dist/$APK_NAME"
+          unzip -tq "dist/$ZIP_NAME"
+          ls -lh dist/
+
+          {
+            echo "VERSION_NAME=$VERSION_NAME"
+            echo "APK_NAME=$APK_NAME"
+            echo "ZIP_NAME=$ZIP_NAME"
+          } >> "$GITHUB_ENV"
+
+          {
+            printf '## NICH Employee Attendance 3 v%s\n\n' "$VERSION_NAME"
+            printf -- '- **Direct Android Install (Recommended):** Download `%s` directly and tap to install (no ZIP extraction needed).\n' "$APK_NAME"
+            printf -- '- **Standard ZIP Archive:** `%s` is verified with `unzip -tq` (standard PKZIP format compatible with Android My Files / Files by Google / Windows Explorer).\n' "$ZIP_NAME"
+            printf -- '- **Verified:** `apksigner verify`, `zipalign`, and `aapt2 dump badging` all passed.\n'
+            printf -- '- If Android shows *"App not installed / package conflicts"*, uninstall any older build signed with a different key once before installing.\n'
+          } > dist/RELEASE_NOTES.md
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: nich-attendance-3-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: dist/${{ env.APK_NAME }}
+          compression-level: 0
           if-no-files-found: error
+
+      - name: Publish Direct APK to GitHub Release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="latest-apk"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/${{ env.APK_NAME }}" "dist/${{ env.ZIP_NAME }}" --clobber
+            gh release edit "$TAG" \
+              --title "NICH Employee Attendance 3 v${{ env.VERSION_NAME }} (Direct APK)" \
+              --notes-file dist/RELEASE_NOTES.md
+          else
+            gh release create "$TAG" "dist/${{ env.APK_NAME }}" "dist/${{ env.ZIP_NAME }}" \
+              --title "NICH Employee Attendance 3 v${{ env.VERSION_NAME }} (Direct APK)" \
+              --notes-file dist/RELEASE_NOTES.md
+          fi

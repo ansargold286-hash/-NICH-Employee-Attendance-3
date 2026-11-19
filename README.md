@@ -46,8 +46,12 @@ Enterprise biometric employee attendance terminal built with **Kotlin**, **Jetpa
 4. The installable APK is generated at:
    `app/build/outputs/apk/debug/app-debug.apk`
 
-## GitHub Actions CI
+## GitHub Actions CI & Installing from GitHub
 
-`.github/workflows/android-build.yml` automatically prepares `debug.keystore` (from `secrets.DEBUG_KEYSTORE_BASE64`, `debug.keystore.base64`, or `keytool`), restores `app/google-services.json` from `secrets.GOOGLE_SERVICES_JSON` if provided, runs unit and Robolectric tests, builds `app-debug.apk` with Gradle 9.3.1, and publishes `nich-attendance-3-debug-apk` as a workflow artifact on every push and pull request.
+`.github/workflows/android-build.yml` automatically prepares `debug.keystore` (from `secrets.DEBUG_KEYSTORE_BASE64`, `debug.keystore.base64`, or `keytool`), verifies the keystore with `keytool`, restores `app/google-services.json` from `secrets.GOOGLE_SERVICES_JSON` if provided, runs `:app:lintDebug`, builds `app-debug.apk`, verifies `zipalign`, `apksigner verify`, and `aapt2 dump badging`, and publishes:
+
+- **Direct Installable APK (Recommended on Android):** Open the repository's **Releases → `latest-apk`** section and download **`NICH-Attendance-3-v2.0-debug.apk`** directly (no `.zip` extraction needed).
+- **Standard Compatible ZIP:** Releases also attach **`NICH-Attendance-3-v2.0-debug-apk.zip`** packaged with standard PKZIP deflate headers (avoiding the ZIP64 streaming headers used by GitHub Actions workflow artifact ZIPs that some Android file managers fail to extract).
+- **Install Tip:** If Android reports *"App not installed as package appears to conflict with an existing package"*, uninstall any earlier build signed with a different keystore once before installing the new APK.
 
 > **Important GitHub Push Note:** Automated GitHub exports may exclude `app/google-services.json`. The build succeeds even without it, and if you want CI-generated APKs to include live Firebase (`attendanceapp-f6a0e`) sync, either upload `app/google-services.json` into your GitHub repository or add its contents as a GitHub Repository Secret named `GOOGLE_SERVICES_JSON`.

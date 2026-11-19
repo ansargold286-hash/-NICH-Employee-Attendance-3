@@ -21,3 +21,4 @@ debug.keystore
 *.jks
 *.apk
 *.aab
+/dist/
