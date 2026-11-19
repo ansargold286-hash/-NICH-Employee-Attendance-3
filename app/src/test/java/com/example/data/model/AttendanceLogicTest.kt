@@ -1,8 +1,10 @@
 package com.example.data.model
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AttendanceLogicTest {
@@ -308,5 +310,53 @@ class AttendanceLogicTest {
             ansar
         )
         assertEquals(false, outsideFrame.matched)
+    }
+
+    @Test
+    fun cnicOcrParser_rejectsStraySingleCharacterAndGarbledHeaderWordsLikeOream() {
+        val noisyCardText = """
+            PAKISTAN
+            OREAM
+            ISLAMIC REPUBLIC OF PAKISTAN
+            NATIONAL IDENTITY CARD
+            Name
+            a
+            Muhammad Ansar
+            Father Name
+            Abdul Razzaq
+            Identity Number
+            42101-9876543-1
+        """.trimIndent()
+
+        val parsed = CnicOcrParser.parseFrontOcrText(noisyCardText, insideGreenFrame = true)
+        assertTrue(parsed.isCnicCardDetected)
+        assertEquals("42101-9876543-1", parsed.cnicNumber)
+        assertEquals("Muhammad Ansar", parsed.extractedName)
+
+        // When only OREAM or 'a..' appears in OCR alongside 13-digit CNIC match,
+        // verifyAgainstEmployee MUST resolve cleanly to the verified holder's real name.
+        val ansar = Employee(
+            id = "emp_ansar",
+            name = "محمد انصار (Muhammad Ansar)",
+            cnicNumber = "42101-9876543-1",
+            cnicName = "Muhammad Ansar"
+        )
+        val outcome = CnicOcrParser.verifyAgainstEmployee(
+            CnicScanFrame(
+                cardDetected = true,
+                insideGreenFrame = true,
+                rawOcrText = "PAKISTAN\nOREAM\nName\na..\n42101-9876543-1",
+                extractedName = "a",
+                cnicNumber = "42101-9876543-1"
+            ),
+            ansar
+        )
+        assertTrue(outcome.matched)
+        assertEquals("Muhammad Ansar", outcome.matchedName)
+        assertTrue(CnicOcrParser.isGarbledName("a"))
+        assertTrue(CnicOcrParser.isGarbledName("a.."))
+        assertTrue(CnicOcrParser.isGarbledName("OREAM"))
+        assertFalse(CnicOcrParser.isGarbledName("Muhammad Ansar"))
+        assertEquals("Muhammad Ansar", CnicOcrParser.resolveVerifiedDisplayName("OREAM", ansar))
     }
 }

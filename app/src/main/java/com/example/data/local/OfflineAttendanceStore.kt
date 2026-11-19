@@ -6,6 +6,7 @@ import androidx.core.content.edit
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
 import com.example.data.model.AttendanceTimeRules
+import com.example.data.model.CnicOcrParser
 import com.example.data.model.Employee
 import com.example.data.model.FaceBiometricMatcher
 import com.example.data.model.PasscodeMatchResult
@@ -62,7 +63,9 @@ data class PendingCheckOutLock(
     val lockedAtMillis: Long = System.currentTimeMillis(),
     val isConsolidatedBatch: Boolean = false,
     val batchDateKey: String = "",
-    val batchEmployeeCount: Int = 1
+    val batchEmployeeCount: Int = 1,
+    val matchedCnicName: String = "",
+    val cnicPhotoPath: String = ""
 )
 
 data class ServerLogMetadata(
@@ -232,7 +235,10 @@ class OfflineAttendanceStore(context: Context) {
                 updatedAt = Timestamp.now(),
                 localPhotoPath = durablePhotoPath,
                 cnicNumber = input.cnicNumber.trim(),
-                cnicName = input.cnicName.trim().ifBlank { cleanName },
+                cnicName = input.cnicName.trim()
+                    .takeUnless { CnicOcrParser.isGarbledName(it) }
+                    .orEmpty()
+                    .ifBlank { cleanName },
                 cnicPhotoPath = durableCnicPath
             )
             // Replace if same name already existed cleanly or append new
@@ -388,11 +394,15 @@ class OfflineAttendanceStore(context: Context) {
         matchedCnicNumber: String = ""
     ): AttendanceLog {
         val logId = explicitLogId ?: "log_${UUID.randomUUID().toString().replace("-", "").take(20)}"
+        val resolvedRecordName = matchedCnicName
+            .trim()
+            .takeIf { it.isNotBlank() && !CnicOcrParser.isGarbledName(it) }
+            ?: employee.name
         val entry = AttendanceLog(
             id = logId,
             employeeId = employee.id,
             employeeCode = employee.employeeCode,
-            employeeName = employee.name,
+            employeeName = resolvedRecordName,
             department = employee.department,
             avatarKey = employee.avatarKey,
             eventType = eventType.wireValue,
@@ -404,7 +414,7 @@ class OfflineAttendanceStore(context: Context) {
             locationAddress = locationAddress,
             timeSource = timeSource,
             createdAt = Timestamp.now(),
-            matchedCnicName = matchedCnicName,
+            matchedCnicName = resolvedRecordName,
             matchedCnicNumber = matchedCnicNumber
         )
         val updatedLogs = (listOf(entry) + _logs.value.filterNot { it.id == logId }).take(MAX_LOCAL_LOGS)
@@ -949,7 +959,9 @@ class OfflineAttendanceStore(context: Context) {
                 lockedAtMillis = obj.optLong("lockedAtMillis", System.currentTimeMillis()),
                 isConsolidatedBatch = obj.optBoolean("isConsolidatedBatch", false),
                 batchDateKey = obj.optString("batchDateKey"),
-                batchEmployeeCount = obj.optInt("batchEmployeeCount", 1)
+                batchEmployeeCount = obj.optInt("batchEmployeeCount", 1),
+                matchedCnicName = obj.optString("matchedCnicName"),
+                cnicPhotoPath = obj.optString("cnicPhotoPath")
             )
         } catch (_: Exception) {
             null
@@ -979,6 +991,8 @@ class OfflineAttendanceStore(context: Context) {
             put("isConsolidatedBatch", lock.isConsolidatedBatch)
             put("batchDateKey", lock.batchDateKey)
             put("batchEmployeeCount", lock.batchEmployeeCount)
+            put("matchedCnicName", lock.matchedCnicName)
+            put("cnicPhotoPath", lock.cnicPhotoPath)
         }
         prefs.edit(commit = true) { putString(KEY_PENDING_CHECKOUT_LOCK_JSON, obj.toString()) }
     }

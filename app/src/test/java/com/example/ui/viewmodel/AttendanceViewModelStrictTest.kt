@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -151,6 +152,11 @@ class AttendanceViewModelStrictTest {
 
     @Before
     fun setUp() {
+        runCatching {
+            val cacheField = androidx.core.content.FileProvider::class.java.getDeclaredField("sCache")
+            cacheField.isAccessible = true
+            (cacheField.get(null) as? MutableMap<*, *>)?.clear()
+        }
         Dispatchers.setMain(testDispatcher)
         context = ApplicationProvider.getApplicationContext()
         context.getSharedPreferences("nich_offline_attendance", Context.MODE_PRIVATE)
@@ -1699,6 +1705,130 @@ class AttendanceViewModelStrictTest {
             assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.Scanning)
         } finally {
             photo.delete()
+        }
+    }
+
+    @Test
+    fun verificationCard_hidesRegisteredPhotoShowsOnlyLiveSelfieCnicCardAndCleanCnicName() = runTest(testDispatcher) {
+        val regPhoto = createTempPortrait("reg_ref_hidden.jpg")
+        val liveSelfie = createTempPortrait("live_selfie_shown.jpg")
+        val cnicCard = createTempPortrait("live_cnic_shown.jpg")
+        val employee = com.example.data.model.Employee(
+            id = "emp_ansar",
+            employeeCode = "NICH-4001",
+            name = "محمد انصار (Muhammad Ansar)",
+            department = "Security",
+            localPhotoPath = regPhoto.absolutePath,
+            cnicNumber = "42101-9876543-1",
+            cnicName = "Muhammad Ansar"
+        )
+        try {
+            composeRule.setContent {
+                NichAttendanceTheme {
+                    TerminalDashboardScreen(
+                        terminalPhase = TerminalUiPhase.Verified(
+                            employee = employee,
+                            eventType = AttendanceEventType.CHECK_IN,
+                            verificationMethod = VerificationMethod.FACE_SCAN_1,
+                            confidenceScore = 95,
+                            timestampLabel = "09:15:00 AM",
+                            syncedToCloud = true,
+                            logId = "log_clean_ui",
+                            liveSelfiePath = liveSelfie.absolutePath,
+                            matchedCnicName = "OREAM",
+                            matchedCnicNumber = "42101-9876543-1",
+                            cnicPhotoPath = cnicCard.absolutePath
+                        ),
+                        onStartVipScan = {},
+                        onCameraInitialized = {},
+                        onCameraInitFailed = {},
+                        onFrameAnalyzed = {},
+                        onSendCheckOutEmail = {},
+                        onResetTerminal = {}
+                    )
+                }
+            }
+
+            composeRule.onNodeWithTag("verification_successful_overlay").assertIsDisplayed()
+            composeRule.onNodeWithTag("live_captured_face_photo").assertIsDisplayed()
+            composeRule.onNodeWithTag("live_captured_cnic_photo").assertIsDisplayed()
+            composeRule.onNodeWithTag("verified_employee_name").assertIsDisplayed()
+            composeRule.onNodeWithText("Muhammad Ansar").assertIsDisplayed()
+            composeRule.onNodeWithText("CNIC Verified: Muhammad Ansar • 42101-9876543-1").assertIsDisplayed()
+            composeRule.onNodeWithText("OREAM").assertDoesNotExist()
+            composeRule.onNodeWithContentDescription("Registered profile photo").assertDoesNotExist()
+        } finally {
+            regPhoto.delete()
+            liveSelfie.delete()
+            cnicCard.delete()
+        }
+    }
+
+    @Test
+    fun cnicStepWithGarbledOcrName_resolvesRealCnicNameInAttendanceLogAndTts() = runTest(testDispatcher) {
+        val store = OfflineAttendanceStore(context)
+        val spokenPrompts = mutableListOf<String>()
+        val voiceRecorder = object : VoiceSpeaker {
+            override fun speak(message: String, flush: Boolean) {
+                spokenPrompts += message
+            }
+            override fun shutdown() = Unit
+        }
+        val regPhoto = createTempPortrait("reg_ansar.jpg")
+        val livePhoto = createTempPortrait("live_ansar.jpg")
+        try {
+            store.registerEmployeesBatch(
+                listOf(
+                    LocalRegistrationInput(
+                        name = "محمد انصار (Muhammad Ansar)",
+                        department = "Engineering",
+                        photoPath = regPhoto.absolutePath,
+                        faceSignature = vectorEmployeeA,
+                        cnicPhotoPath = regPhoto.absolutePath,
+                        cnicNumber = "42101-9876543-1",
+                        cnicName = "a" // simulate bad earlier OCR attempt during registration fallback
+                    )
+                )
+            )
+            val viewModel = AttendanceViewModel(
+                offlineStore = store,
+                autoInitBackgroundJobs = false,
+                calendarProvider = { morningCheckInCalendar() },
+                voiceSpeaker = voiceRecorder
+            )
+            runCurrent()
+            viewModel.startVipBiometricScan()
+            viewModel.onCameraInitialized()
+            runCurrent()
+
+            feedLiveHumanBlinkFrames(viewModel, vectorEmployeeA, livePhoto.absolutePath)
+            assertTrue(viewModel.terminalPhase.value is TerminalUiPhase.CnicScanning)
+
+            // Noisy OCR with "OREAM" & "a" but valid matching CNIC number
+            viewModel.onCnicFrameAnalyzed(
+                CnicScanFrame(
+                    cardDetected = true,
+                    insideGreenFrame = true,
+                    rawOcrText = "PAKISTAN\nOREAM\nName\na\n42101-9876543-1",
+                    extractedName = "a",
+                    cnicNumber = "42101-9876543-1",
+                    cnicImagePath = livePhoto.absolutePath
+                )
+            )
+            runCurrent()
+
+            val verified = viewModel.terminalPhase.value as TerminalUiPhase.Verified
+            assertEquals("Muhammad Ansar", verified.matchedCnicName)
+            assertFalse(verified.matchedCnicName.equals("a", ignoreCase = true))
+            assertFalse(verified.matchedCnicName.contains("OREAM"))
+
+            val logged = store.logs.value.first()
+            assertEquals("Muhammad Ansar", logged.employeeName)
+            assertEquals("Muhammad Ansar", logged.matchedCnicName)
+            assertTrue(spokenPrompts.any { it.contains("Muhammad Ansar") })
+        } finally {
+            regPhoto.delete()
+            livePhoto.delete()
         }
     }
 }

@@ -365,4 +365,88 @@ class AttendanceReportTest {
             batchPdf.delete()
         }
     }
+
+    @Test
+    fun generateReportPdf_embedsLiveSelfieAndCnicCardWhileOmittingRegisteredReferencePhoto() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val regRefFile = java.io.File(context.cacheDir, "registered_ref_should_not_appear.jpg")
+        val liveSelfieFile = java.io.File(context.cacheDir, "live_selfie_only.jpg")
+        val cnicCardFile = java.io.File(context.cacheDir, "scanned_cnic_card.jpg")
+        listOf(regRefFile, liveSelfieFile, cnicCardFile).forEach { file ->
+            val bmp = android.graphics.Bitmap.createBitmap(48, 48, android.graphics.Bitmap.Config.ARGB_8888)
+            java.io.FileOutputStream(file).use { stream ->
+                bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, stream)
+            }
+            bmp.recycle()
+        }
+
+        val employee = Employee(
+            id = "emp_ansar",
+            employeeCode = "NICH-4001",
+            name = "محمد انصار (Muhammad Ansar)",
+            department = "Security",
+            localPhotoPath = regRefFile.absolutePath,
+            cnicName = "Muhammad Ansar",
+            cnicNumber = "42101-9876543-1"
+        )
+        val log = AttendanceLog(
+            id = "log_live_only",
+            employeeId = employee.id,
+            employeeCode = employee.employeeCode,
+            employeeName = "Muhammad Ansar",
+            department = employee.department,
+            eventType = AttendanceEventType.CHECK_OUT.wireValue,
+            verificationMethod = VerificationMethod.FACE_SCAN_1.wireValue,
+            confidenceScore = 96L,
+            loggedTimeLabel = "05:30:00 PM",
+            loggedDateKey = "2026-11-18",
+            matchedCnicName = "Muhammad Ansar",
+            matchedCnicNumber = "42101-9876543-1"
+        )
+
+        // When liveSelfiePath is provided alongside cnicPhotoPath, PDF succeeds cleanly
+        val pdfWithLiveAndCnic = AttendancePdfGenerator.generateReportPdf(
+            context = context,
+            employee = employee,
+            log = log,
+            eventType = AttendanceEventType.CHECK_OUT,
+            verificationMethod = VerificationMethod.FACE_SCAN_1,
+            confidenceScore = 96,
+            syncedToCloud = true,
+            recentDailyLogs = listOf(log),
+            recipientEmail = AttendanceEmailReporter.TARGET_RECIPIENT_EMAIL,
+            liveSelfiePath = liveSelfieFile.absolutePath,
+            cnicPhotoPath = cnicCardFile.absolutePath
+        )
+
+        // When liveSelfiePath is deleted, deleting regRefFile beforehand must not change batch summary selection
+        regRefFile.delete()
+        val batchSummary = AttendancePdfGenerator.buildBatchReportSummary(
+            employees = listOf(employee),
+            logs = listOf(log),
+            dateKey = "2026-11-18",
+            selfiePathsByLogId = mapOf(log.id to liveSelfieFile.absolutePath)
+        )
+        assertEquals("Muhammad Ansar", batchSummary.rows.single().employee.cnicName)
+        assertEquals(liveSelfieFile.absolutePath, batchSummary.rows.single().liveSelfiePath)
+
+        val summaryWithoutLiveSelfie = AttendancePdfGenerator.buildBatchReportSummary(
+            employees = listOf(employee),
+            logs = listOf(log),
+            dateKey = "2026-11-18",
+            selfiePathsByLogId = emptyMap()
+        )
+        assertEquals(null, summaryWithoutLiveSelfie.rows.single().liveSelfiePath)
+
+        try {
+            assertTrue(pdfWithLiveAndCnic.exists())
+            assertTrue(pdfWithLiveAndCnic.length() > 1500L)
+            val header = pdfWithLiveAndCnic.readBytes().copyOfRange(0, 5).toString(StandardCharsets.US_ASCII)
+            assertEquals("%PDF-", header)
+        } finally {
+            pdfWithLiveAndCnic.delete()
+            liveSelfieFile.delete()
+            cnicCardFile.delete()
+        }
+    }
 }

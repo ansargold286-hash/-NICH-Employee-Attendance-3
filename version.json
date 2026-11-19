@@ -1,0 +1,6 @@
+{
+  "latestVersionCode": 2,
+  "latestVersionName": "2.0",
+  "apkUrl": "https://github.com/nich-attendance/nich-attendance-3/releases/download/latest-apk/NICH-Attendance-3-v2.0-debug.apk",
+  "releaseNotes": "CNIC holder name extraction fix, live-photo-only verification card/PDF, and GitHub in-app auto-updater."
+}

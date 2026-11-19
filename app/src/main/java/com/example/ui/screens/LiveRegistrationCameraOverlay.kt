@@ -300,17 +300,27 @@ internal fun LiveRegistrationCameraOverlay(
                                                     if (parsed.cnicNumber.isNotBlank()) {
                                                         detectedCnicNumber = parsed.cnicNumber
                                                     }
-                                                    if (parsed.extractedName.isNotBlank()) {
-                                                        detectedCnicName = parsed.extractedName
+                                                    val cleanParsedName = parsed.extractedName
+                                                        .takeIf { it.isNotBlank() && !com.example.data.model.CnicOcrParser.isGarbledName(it) }
+                                                        .orEmpty()
+                                                    if (cleanParsedName.isNotBlank()) {
+                                                        detectedCnicName = cleanParsedName
                                                     }
 
                                                     val validCardFrame = insideGreen && parsed.isCnicCardDetected
+                                                    val hasGoodFields = (cleanParsedName.isNotBlank() || detectedCnicName.isNotBlank()) &&
+                                                        (parsed.cnicNumber.isNotBlank() || detectedCnicNumber.isNotBlank())
                                                     cnicAligned = validCardFrame
                                                     if (validCardFrame) {
                                                         cnicStableCount++
-                                                        statusText = "CNIC Aligned Inside Green Frame • Auto-Snapping..."
+                                                        statusText = if (hasGoodFields) {
+                                                            "CNIC & Name Locked Inside Green Frame • Auto-Snapping..."
+                                                        } else {
+                                                            "Hold Steady Inside Green Frame • Reading CNIC Name..."
+                                                        }
                                                         val bestPath = cnicSnapPath ?: latestRearCnicSnapshotPath
-                                                        if (cnicStableCount >= 2 && bestPath != null &&
+                                                        val readyToAutoSnap = cnicStableCount >= if (hasGoodFields) 2 else 5
+                                                        if (readyToAutoSnap && bestPath != null &&
                                                             autoSnapCompletedRef.compareAndSet(false, true)
                                                         ) {
                                                             val facePath = capturedFaceConfirmedPath ?: capturedReadyPath.orEmpty()
@@ -320,7 +330,7 @@ internal fun LiveRegistrationCameraOverlay(
                                                                 faceSig,
                                                                 bestPath,
                                                                 parsed.cnicNumber.ifBlank { detectedCnicNumber },
-                                                                parsed.extractedName.ifBlank { detectedCnicName }
+                                                                cleanParsedName.ifBlank { detectedCnicName }
                                                             )
                                                         }
                                                     } else {

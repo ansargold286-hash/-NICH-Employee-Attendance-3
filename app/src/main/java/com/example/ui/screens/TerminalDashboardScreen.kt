@@ -9,6 +9,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -59,6 +61,7 @@ import androidx.compose.ui.unit.dp
 import com.example.BuildConfig
 import com.example.R
 import com.example.data.model.AttendanceEventType
+import com.example.data.model.CnicOcrParser
 import com.example.data.model.CnicScanFrame
 import com.example.data.model.FaceAnalysisFrame
 import com.example.data.model.LivenessDirection
@@ -92,7 +95,8 @@ fun TerminalDashboardScreen(
     networkTimeLabel: String = "NTP Network Time",
     modifier: Modifier = Modifier,
     onCnicFrameAnalyzed: (CnicScanFrame) -> Unit = {},
-    onCancelCnicScan: () -> Unit = {}
+    onCancelCnicScan: () -> Unit = {},
+    onCheckUpdatesClick: () -> Unit = {}
 ) {
     LaunchedEffect(terminalPhase) {
         if (terminalPhase is TerminalUiPhase.Ready) {
@@ -209,7 +213,13 @@ fun TerminalDashboardScreen(
                         style = MaterialTheme.typography.labelSmall,
                         color = NeonCyan.copy(alpha = 0.85f),
                         textAlign = TextAlign.Center,
-                        modifier = Modifier.testTag("app_version_badge")
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable(onClickLabel = "Check for app updates") {
+                                onCheckUpdatesClick()
+                            }
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                            .testTag("app_version_badge")
                     )
                 }
             }
@@ -322,20 +332,8 @@ private fun VerificationSuccessOverlay(
     onAttemptDismiss: () -> Unit
 ) {
     val accent = if (phase.eventType == AttendanceEventType.CHECK_IN) NeonGreen else NeonCyan
-    val registeredPhotoBitmap = remember(phase.employee.localPhotoPath) {
-        val registeredPath = phase.employee.localPhotoPath.takeIf { it.isNotBlank() }
-        if (registeredPath.isNullOrBlank()) {
-            null
-        } else {
-            runCatching {
-                val file = File(registeredPath)
-                if (file.exists() && file.length() > 0L) {
-                    BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
-                } else {
-                    null
-                }
-            }.getOrNull()
-        }
+    val verifiedDisplayName = remember(phase.matchedCnicName, phase.employee) {
+        CnicOcrParser.resolveVerifiedDisplayName(phase.matchedCnicName, phase.employee)
     }
     val liveSelfieBitmap = remember(phase.liveSelfiePath) {
         val selfiePath = phase.liveSelfiePath.takeIf { !it.isNullOrBlank() }
@@ -344,6 +342,21 @@ private fun VerificationSuccessOverlay(
         } else {
             runCatching {
                 val file = File(selfiePath)
+                if (file.exists() && file.length() > 0L) {
+                    BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
+                } else {
+                    null
+                }
+            }.getOrNull()
+        }
+    }
+    val liveCnicBitmap = remember(phase.cnicPhotoPath) {
+        val cnicPath = phase.cnicPhotoPath.takeIf { !it.isNullOrBlank() }
+        if (cnicPath.isNullOrBlank()) {
+            null
+        } else {
+            runCatching {
+                val file = File(cnicPath)
                 if (file.exists() && file.length() > 0L) {
                     BitmapFactory.decodeFile(file.absolutePath)?.asImageBitmap()
                 } else {
@@ -441,43 +454,45 @@ private fun VerificationSuccessOverlay(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val primaryBitmap = liveSelfieBitmap ?: registeredPhotoBitmap
-                    if (primaryBitmap != null) {
+                    if (liveSelfieBitmap != null) {
                         Box(
                             modifier = Modifier
                                 .size(92.dp)
                                 .clip(CircleShape)
                                 .border(2.dp, accent, CircleShape)
-                                .background(ObsidianElevated),
+                                .background(ObsidianElevated)
+                                .testTag("live_captured_face_photo"),
                             contentAlignment = Alignment.Center
                         ) {
                             Image(
-                                bitmap = primaryBitmap,
-                                contentDescription = phase.employee.name,
+                                bitmap = liveSelfieBitmap,
+                                contentDescription = "Live captured face of $verifiedDisplayName",
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
                     } else {
                         EmployeeAvatar(
-                            name = phase.employee.name,
+                            name = verifiedDisplayName,
                             avatarKey = phase.employee.avatarKey,
                             size = 86.dp,
                             ringColor = accent
                         )
                     }
-                    if (liveSelfieBitmap != null && registeredPhotoBitmap != null) {
+                    if (liveCnicBitmap != null) {
                         Box(
                             modifier = Modifier
-                                .size(76.dp)
-                                .clip(CircleShape)
-                                .border(1.5.dp, TextSecondary, CircleShape)
-                                .background(ObsidianElevated),
+                                .width(116.dp)
+                                .height(74.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .border(1.5.dp, accent.copy(alpha = 0.75f), RoundedCornerShape(10.dp))
+                                .background(ObsidianElevated)
+                                .testTag("live_captured_cnic_photo"),
                             contentAlignment = Alignment.Center
                         ) {
                             Image(
-                                bitmap = registeredPhotoBitmap,
-                                contentDescription = "Registered profile photo",
+                                bitmap = liveCnicBitmap,
+                                contentDescription = "Scanned CNIC front card",
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()
                             )
@@ -486,13 +501,14 @@ private fun VerificationSuccessOverlay(
                 }
 
                 Text(
-                    text = phase.employee.name,
+                    text = verifiedDisplayName,
                     style = MaterialTheme.typography.titleMedium,
                     color = TextPrimary,
                     fontWeight = FontWeight.SemiBold,
                     textAlign = TextAlign.Center,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.testTag("verified_employee_name")
                 )
 
                 Text(
@@ -506,7 +522,7 @@ private fun VerificationSuccessOverlay(
                     phase.locationAddress.isNotBlank() ||
                     phase.timeSourceLabel.isNotBlank() ||
                     phase.matchedCnicNumber.isNotBlank() ||
-                    phase.matchedCnicName.isNotBlank()
+                    verifiedDisplayName.isNotBlank()
                 ) {
                     Surface(
                         shape = RoundedCornerShape(12.dp),
@@ -522,8 +538,8 @@ private fun VerificationSuccessOverlay(
                                 .padding(horizontal = 12.dp, vertical = 8.dp),
                             verticalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
-                            if (phase.matchedCnicNumber.isNotBlank() || phase.matchedCnicName.isNotBlank()) {
-                                val cnicLabel = listOf(phase.matchedCnicName, phase.matchedCnicNumber)
+                            if (phase.matchedCnicNumber.isNotBlank() || verifiedDisplayName.isNotBlank()) {
+                                val cnicLabel = listOf(verifiedDisplayName, phase.matchedCnicNumber)
                                     .filter { it.isNotBlank() }
                                     .joinToString(" • ")
                                 Text(

@@ -57,11 +57,24 @@ object CnicOcrParser {
     )
 
     private val excludedCandidateTokens = setOf(
-        "PAKISTAN", "ISLAMIC", "REPUBLIC", "OF", "NATIONAL", "IDENTITY", "CARD",
-        "NAME", "FATHER", "HUSBAND", "GENDER", "MALE", "FEMALE", "COUNTRY",
-        "STAY", "NUMBER", "DATE", "BIRTH", "ISSUE", "EXPIRY", "SIGNATURE",
-        "HOLDER", "THE", "NADRA", "GOVT", "GOVERNMENT"
+        "PAKISTAN", "PAKISTANI", "ISLAMIC", "REPUBLIC", "OF", "NATIONAL", "IDENTITY", "CARD",
+        "NAME", "FATHER", "FATHERS", "HUSBAND", "HUSBANDS", "MOTHER", "GENDER", "MALE", "FEMALE",
+        "COUNTRY", "STAY", "NUMBER", "DATE", "BIRTH", "ISSUE", "EXPIRY", "SIGNATURE", "SIGN",
+        "HOLDER", "HOLDERS", "THE", "NADRA", "GOVT", "GOVERNMENT", "FEDERAL", "SPECIMEN",
+        "THUMB", "IMPRESSION", "CNIC", "NICOP", "POC", "SO", "DO", "WO"
     )
+
+    private val fuzzyBoilerplateKeywords = listOf(
+        "PAKISTAN", "ISLAMIC", "REPUBLIC", "NATIONAL", "IDENTITY", "SIGNATURE",
+        "COUNTRY", "HUSBAND", "FATHER", "MOTHER", "HOLDER", "SPECIMEN",
+        "GOVERNMENT", "FEDERAL", "EXPIRY", "BIRTH", "NUMBER", "GENDER"
+    )
+
+    private val cardHeaderRegex = Regex(
+        """(?i).*(PAKISTAN|ISLAMIC\s+REPUBLIC|NATIONAL\s+IDENTITY|IDENTITY\s+NUMBER|COUNTRY\s+OF\s+STAY|DATE\s+OF\s+(BIRTH|ISSUE|EXPIRY)|HOLDER.?S?\s+SIGN).*"""
+    )
+    private val relationHeaderRegex = Regex("""(?i).*\b(FATHER|HUSBAND|MOTHER)\b.*""")
+    private val relationMarkerRegex = Regex("""(?i)^(?:S\s*/?\s*O|D\s*/?\s*O|W\s*/?\s*O)\b.*""")
 
     fun parseFrontOcrText(
         rawText: String,
@@ -105,43 +118,109 @@ object CnicOcrParser {
     }
 
     internal fun extractHolderName(rawText: String): String {
-        val lines = rawText.lines()
-            .map { it.replace(Regex("""[^\p{L}\p{N}\s.:'-]"""), " ").trim() }
+        val rawLines = rawText.lines()
+            .map { it.trim() }
             .filter { it.isNotBlank() }
+        if (rawLines.isEmpty()) return ""
 
-        // Pass 1: Look explicitly after "Name" label (not Father/Husband Name)
-        for (i in lines.indices) {
-            val line = lines[i]
-            val upper = line.uppercase(Locale.US)
-            val isFatherOrHusband = upper.contains("FATHER") || upper.contains("HUSBAND")
-            if (!isFatherOrHusband && Regex("""^NAME\b[:\s-]*.*""").matches(upper)) {
-                val sameLineValue = line.replaceFirst(Regex("""(?i)^name\s*[:\-]?\s*"""), "").trim()
-                val cleanedSame = sanitizeNameCandidate(sameLineValue)
-                if (cleanedSame.length >= 3 && !isBoilerplateLine(cleanedSame)) {
-                    return cleanedSame
+        // Track where card structure markers appear so Pass 2 avoids header watermark/Urdu OCR noise
+        var nameLabelIdx = -1
+        var fatherLabelIdx = -1
+        var cardHeaderEndIdx = -1
+
+        rawLines.forEachIndexed { idx, rawLine ->
+            val latinUpper = rawLine.replace(Regex("""[^A-Za-z0-9\s:/-]"""), " ")
+                .replace(Regex("""\s+"""), " ")
+                .trim()
+                .uppercase(Locale.US)
+            if (latinUpper.isBlank()) return@forEachIndexed
+
+            if (cardHeaderRegex.matches(latinUpper)) {
+                cardHeaderEndIdx = max(cardHeaderEndIdx, idx)
+            }
+            if (fatherLabelIdx == -1 && relationHeaderRegex.matches(latinUpper)) {
+                fatherLabelIdx = idx
+            }
+            if (nameLabelIdx == -1 &&
+                !relationHeaderRegex.matches(latinUpper) &&
+                Regex("""(?i)(?:^|\b)(?:HOLDER\s+)?NAME\b.*""").matches(latinUpper)
+            ) {
+                nameLabelIdx = idx
+            }
+        }
+
+        // Pass 1: Explicitly inspect the Name line and up to 3 lines immediately below it
+        // (skipping Urdu-only lines that sanitize to blank, e.g. "نام", and stopping at Father/Husband/digits)
+        if (nameLabelIdx >= 0) {
+            val labelLine = rawLines[nameLabelIdx]
+            val sameLineAfterLabel = labelLine
+                .replaceFirst(Regex("""(?i).*?\bname\b\s*[:\-/|]*\s*"""), "")
+                .trim()
+            val cleanedSame = sanitizeNameCandidate(sameLineAfterLabel)
+            if (isValidHumanName(cleanedSame, allowSingleWord = true)) {
+                return formatExtractedNameCasing(cleanedSame)
+            }
+
+            val searchEnd = min(rawLines.lastIndex, nameLabelIdx + 3)
+            for (j in (nameLabelIdx + 1)..searchEnd) {
+                val nextRaw = rawLines[j]
+                val nextUpper = nextRaw.uppercase(Locale.US)
+                if (relationHeaderRegex.matches(nextUpper) ||
+                    cardHeaderRegex.matches(nextUpper) ||
+                    cnicHyphenRegex.containsMatchIn(nextRaw) ||
+                    nextRaw.count { it.isDigit() } >= 4
+                ) {
+                    break
                 }
-                val nextLine = lines.getOrNull(i + 1)
-                if (!nextLine.isNullOrBlank()) {
-                    val cleanedNext = sanitizeNameCandidate(nextLine)
-                    if (cleanedNext.length >= 3 && !isBoilerplateLine(cleanedNext)) {
-                        return cleanedNext
-                    }
+                val cleanedNext = sanitizeNameCandidate(nextRaw)
+                if (cleanedNext.isBlank()) {
+                    // e.g. Urdu-only line between "Name" label and English value
+                    continue
+                }
+                if (isValidHumanName(cleanedNext, allowSingleWord = true)) {
+                    return formatExtractedNameCasing(cleanedNext)
                 }
             }
         }
 
-        // Pass 2: Best clean alphabetic human name line (2+ chars, no digits, not card header)
-        for (line in lines) {
-            val candidate = sanitizeNameCandidate(line)
-            if (candidate.length >= 4 &&
-                !candidate.any { it.isDigit() } &&
-                !isBoilerplateLine(candidate)
-            ) {
-                val words = candidate.split(Regex("""\s+""")).filter { it.isNotBlank() }
-                if (words.size in 1..5 && words.all { it.length >= 2 }) {
-                    return candidate
-                }
+        // Pass 2: Score all candidate lines across the card, strongly favoring multi-word names
+        // situated after the card header and before the Father/Husband Name field.
+        val fatherValueIdx = if (fatherLabelIdx >= 0) fatherLabelIdx + 1 else -1
+        var bestCandidate = ""
+        var bestScore = Int.MIN_VALUE
+
+        rawLines.forEachIndexed { idx, rawLine ->
+            if (idx == nameLabelIdx || idx == fatherLabelIdx || idx == fatherValueIdx) return@forEachIndexed
+            if (rawLine.any { it.isDigit() }) return@forEachIndexed
+
+            val candidate = sanitizeNameCandidate(rawLine)
+            if (!isValidHumanName(candidate, allowSingleWord = false)) return@forEachIndexed
+
+            val words = candidate.split(" ").filter { it.isNotBlank() }
+            var score = 0
+            if (words.size in 2..4) score += 60
+            else if (words.size == 1) score += 10
+
+            // Title case / mixed case ("Bilal Ahmed") is far more likely printed data than header watermark noise
+            val hasMixedCase = candidate.any { it.isUpperCase() } && candidate.any { it.isLowerCase() }
+            if (hasMixedCase) score += 35
+
+            // Lines after NATIONAL IDENTITY CARD and before Father Name are prime Holder Name territory
+            if (cardHeaderEndIdx in 0 until idx) score += 30
+            if (fatherLabelIdx >= 0 && idx < fatherLabelIdx) score += 35
+            if (fatherLabelIdx >= 0 && idx > fatherLabelIdx) score -= 25
+
+            // Slight preference for earlier non-header lines when scores tie
+            score -= idx
+
+            if (score > bestScore) {
+                bestScore = score
+                bestCandidate = candidate
             }
+        }
+
+        if (bestCandidate.isNotBlank()) {
+            return formatExtractedNameCasing(bestCandidate)
         }
 
         return ""
@@ -174,7 +253,11 @@ object CnicOcrParser {
         }
 
         val observedCnic = frame.cnicNumber.ifBlank { parsed.cnicNumber }
-        val observedName = frame.extractedName.ifBlank { parsed.extractedName }
+        val sanitizedFrameName = sanitizeNameCandidate(frame.extractedName)
+            .takeIf { isValidHumanName(it, allowSingleWord = true) }
+            .orEmpty()
+        val observedName = parsed.extractedName.ifBlank { sanitizedFrameName }
+        val canonicalEmployeeName = preferredCleanName(employee)
 
         // 1. Check stored CNIC number if BOTH employee profile and scanned card provide 13 digits
         val registeredCnicDigits = digitsOnly(employee.cnicNumber)
@@ -182,12 +265,13 @@ object CnicOcrParser {
         if (registeredCnicDigits.length == 13 && scannedCnicDigits.length == 13) {
             val digitOverlap = registeredCnicDigits.zip(scannedCnicDigits).count { (a, b) -> a == b }
             if (registeredCnicDigits == scannedCnicDigits) {
-                val displayName = observedName.ifBlank {
-                    candidateNamesFor(employee).firstOrNull().orEmpty()
-                }
+                val resolvedMatchedName = resolveVerifiedDisplayName(
+                    observedName = findBestMatchingLineName(frame.rawOcrText, observedName, employee),
+                    employee = employee
+                )
                 return CnicMatchOutcome(
                     matched = true,
-                    matchedName = displayName,
+                    matchedName = resolvedMatchedName,
                     matchedCnicNumber = observedCnic,
                     similarityPercent = 100,
                     reason = "CNIC number & identity verified"
@@ -198,7 +282,7 @@ object CnicOcrParser {
                     matchedName = observedName,
                     matchedCnicNumber = observedCnic,
                     similarityPercent = (digitOverlap * 100) / 13,
-                    reason = "CNIC mismatch ($observedCnic) does not belong to ${employee.name}"
+                    reason = "CNIC mismatch ($observedCnic) does not belong to ${canonicalEmployeeName.ifBlank { employee.name }}"
                 )
             }
         }
@@ -234,17 +318,112 @@ object CnicOcrParser {
         }
 
         val matched = bestScore >= NAME_MATCH_THRESHOLD_PERCENT
+        val resolvedMatchedName = if (matched) {
+            resolveVerifiedDisplayName(
+                observedName = findBestMatchingLineName(frame.rawOcrText, observedName, employee),
+                employee = employee
+            )
+        } else {
+            observedName
+        }
+
         return CnicMatchOutcome(
             matched = matched,
-            matchedName = observedName.ifBlank { if (matched) bestCandidate else "" },
+            matchedName = resolvedMatchedName,
             matchedCnicNumber = observedCnic,
             similarityPercent = bestScore,
             reason = if (matched) {
-                "CNIC verified ($bestScore% match: ${observedName.ifBlank { bestCandidate }})"
+                "CNIC verified ($bestScore% match: $resolvedMatchedName)"
             } else {
-                "CNIC name (${observedName.ifBlank { "unreadable" }}) did not match $bestCandidate ($bestScore%)"
+                "CNIC name (${observedName.ifBlank { "unreadable" }}) did not match ${canonicalEmployeeName.ifBlank { bestCandidate }} ($bestScore%)"
             }
         )
+    }
+
+    /**
+     * Resolves a clean, trustworthy holder name for display in Attendance UI, TTS, and PDF reports.
+     * Never returns stray single letters ("a") or garbled header OCR noise ("OREAM").
+     */
+    fun resolveVerifiedDisplayName(observedName: String, employee: Employee): String {
+        val canonical = preferredCleanName(employee)
+        val cleanedObserved = sanitizeNameCandidate(observedName)
+        if (cleanedObserved.isBlank() || isGarbledName(cleanedObserved)) {
+            return canonical.ifBlank { employee.name }
+        }
+
+        if (canonical.isBlank()) {
+            return formatExtractedNameCasing(cleanedObserved)
+        }
+
+        val simToCanonical = computeNameSimilarityPercent(canonical, cleanedObserved)
+        val observedWords = cleanedObserved.split(" ").filter { it.isNotBlank() }
+        val canonicalWords = sanitizeNameCandidate(canonical).split(" ").filter { it.isNotBlank() }
+
+        return when {
+            // If OCR had small spelling typos (e.g. "Muhamad Ansar" vs "Muhammad Ansar") or noise, use canonical spelling
+            simToCanonical >= NAME_MATCH_THRESHOLD_PERCENT && canonicalWords.size >= observedWords.size -> canonical
+            // If OCR cleanly read a fuller real name matching the employee (e.g., extra middle/last name on CNIC)
+            simToCanonical >= NAME_MATCH_THRESHOLD_PERCENT && observedWords.size > canonicalWords.size ->
+                formatExtractedNameCasing(cleanedObserved)
+            // If observedName did not match the employee (e.g. matched via 13-digit CNIC while OCR misread "OREAM")
+            else -> canonical
+        }
+    }
+
+    fun isGarbledName(rawName: String): Boolean {
+        val cleaned = sanitizeNameCandidate(BidiTextHelper.stripBidiControls(rawName))
+        if (cleaned.isBlank()) return true
+        return !isValidHumanName(cleaned, allowSingleWord = true)
+    }
+
+    private fun preferredCleanName(employee: Employee): String {
+        val rawCnicName = BidiTextHelper.stripBidiControls(employee.cnicName).trim()
+        parenEnglishRegex.find(rawCnicName)?.groupValues?.getOrNull(1)?.trim()?.let { inside ->
+            val cleanInside = sanitizeNameCandidate(inside)
+            if (cleanInside.isNotBlank() && isValidHumanName(cleanInside, allowSingleWord = true)) {
+                return formatExtractedNameCasing(cleanInside)
+            }
+        }
+        val sanitizedCnic = sanitizeNameCandidate(rawCnicName)
+        if (sanitizedCnic.isNotBlank() && isValidHumanName(sanitizedCnic, allowSingleWord = true)) {
+            return formatExtractedNameCasing(sanitizedCnic)
+        }
+        val stripped = BidiTextHelper.stripBidiControls(employee.name).trim()
+        parenEnglishRegex.find(stripped)?.groupValues?.getOrNull(1)?.trim()?.let { inside ->
+            if (inside.any { it in 'A'..'Z' || it in 'a'..'z' }) {
+                val cleanInside = sanitizeNameCandidate(inside)
+                return if (cleanInside.isNotBlank()) formatExtractedNameCasing(cleanInside) else inside
+            }
+        }
+        return stripped.ifBlank { employee.name }
+    }
+
+    private fun findBestMatchingLineName(
+        rawOcrText: String,
+        primaryObserved: String,
+        employee: Employee
+    ): String {
+        val canonical = preferredCleanName(employee)
+        if (primaryObserved.isNotBlank() && !isGarbledName(primaryObserved)) {
+            if (canonical.isBlank() || computeNameSimilarityPercent(canonical, primaryObserved) >= NAME_MATCH_THRESHOLD_PERCENT) {
+                return primaryObserved
+            }
+        }
+        if (canonical.isBlank() || rawOcrText.isBlank()) return primaryObserved
+
+        var bestLineName = primaryObserved
+        var bestSim = if (primaryObserved.isNotBlank()) computeNameSimilarityPercent(canonical, primaryObserved) else 0
+
+        for (line in rawOcrText.lines()) {
+            val cleaned = sanitizeNameCandidate(line)
+            if (!isValidHumanName(cleaned, allowSingleWord = true)) continue
+            val sim = computeNameSimilarityPercent(canonical, cleaned)
+            if (sim > bestSim) {
+                bestSim = sim
+                bestLineName = cleaned
+            }
+        }
+        return bestLineName
     }
 
     internal fun candidateNamesFor(employee: Employee): List<String> {
@@ -329,18 +508,78 @@ object CnicOcrParser {
         return dp[n]
     }
 
-    private fun sanitizeNameCandidate(input: String): String {
-        return input
-            .replace(Regex("""[^A-Za-z\s.'-]"""), " ")
+    internal fun sanitizeNameCandidate(input: String): String {
+        val lettersAndSpaces = input
+            .replace(Regex("""(?i)\b(?:s|d|w)\s*/\s*o\b.*"""), " ")
+            .replace(Regex("""[^A-Za-z\s]"""), " ")
             .replace(Regex("""\s+"""), " ")
             .trim()
+        if (lettersAndSpaces.isBlank()) return ""
+
+        val filteredWords = lettersAndSpaces.split(" ")
+            .filter { token ->
+                token.length >= 2 || (token.length == 1 && token in setOf("M"))
+            }
+        return filteredWords.joinToString(" ").trim()
+    }
+
+    internal fun isValidHumanName(candidate: String, allowSingleWord: Boolean): Boolean {
+        if (candidate.isBlank()) return false
+        if (relationMarkerRegex.matches(candidate)) return false
+        if (isBoilerplateLine(candidate)) return false
+
+        val words = candidate.split(Regex("""\s+""")).filter { it.isNotBlank() }
+        if (words.isEmpty() || words.size > 5) return false
+
+        val letterCount = words.sumOf { word -> word.count { it in 'A'..'Z' || it in 'a'..'z' } }
+        if (letterCount < 3) return false
+        if (!words.any { it.length >= 3 }) return false
+
+        // Reject any single-letter / stray 2-letter artifact or short single ALL-CAPS header noise (e.g. "OREAM")
+        if (words.size == 1) {
+            if (!allowSingleWord) return false
+            val single = words.first()
+            if (single.length < 4) return false
+            val allCaps = single.all { it.isUpperCase() }
+            if (allCaps && single.length < 7) return false
+        } else {
+            // Multi-word candidate must have at least two meaningful tokens (e.g. avoid "Dr a")
+            if (words.count { it.length >= 2 } < 2) return false
+        }
+
+        // Real South-Asian / English names always contain vowels
+        val hasVowel = words.all { word ->
+            word.length <= 2 || word.lowercase(Locale.US).any { it in "aeiouy" }
+        }
+        return hasVowel
+    }
+
+    private fun formatExtractedNameCasing(cleanName: String): String {
+        val words = cleanName.split(Regex("""\s+""")).filter { it.isNotBlank() }
+        val isAllUpper = words.all { token -> token.all { !it.isLetter() || it.isUpperCase() } }
+        val isAllLower = words.all { token -> token.all { !it.isLetter() || it.isLowerCase() } }
+        if (!isAllUpper && !isAllLower) return cleanName
+        return words.joinToString(" ") { word ->
+            val lower = word.lowercase(Locale.US)
+            lower.replaceFirstChar { ch -> ch.titlecase(Locale.US) }
+        }
     }
 
     private fun isBoilerplateLine(candidate: String): Boolean {
-        val tokens = candidate.uppercase(Locale.US).split(" ").filter { it.isNotBlank() }
+        val tokens = candidate.uppercase(Locale.US).split(Regex("""\s+""")).filter { it.isNotBlank() }
         if (tokens.isEmpty()) return true
-        val nonBoilerplate = tokens.count { it !in excludedCandidateTokens }
+        val nonBoilerplate = tokens.count { token ->
+            token !in excludedCandidateTokens && !isFuzzyBoilerplateToken(token)
+        }
         return nonBoilerplate == 0
+    }
+
+    private fun isFuzzyBoilerplateToken(tokenUpper: String): Boolean {
+        if (tokenUpper.length < 4) return false
+        return fuzzyBoilerplateKeywords.any { keyword ->
+            kotlin.math.abs(tokenUpper.length - keyword.length) <= 2 &&
+                levenshteinSimilarityPercent(tokenUpper, keyword) >= 78
+        }
     }
 
     private fun normalizeAlpha(raw: String): String {

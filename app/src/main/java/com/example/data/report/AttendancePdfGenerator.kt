@@ -19,6 +19,7 @@ import android.text.TextUtils
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
 import com.example.data.model.BidiTextHelper
+import com.example.data.model.CnicOcrParser
 import com.example.data.model.Employee
 import com.example.data.model.VerificationMethod
 import java.io.File
@@ -89,7 +90,8 @@ object AttendancePdfGenerator {
         syncedToCloud: Boolean,
         recentDailyLogs: List<AttendanceLog>,
         recipientEmail: String,
-        liveSelfiePath: String? = null
+        liveSelfiePath: String? = null,
+        cnicPhotoPath: String? = null
     ): File {
         val reportsDir = File(context.cacheDir, "attendance_reports").apply {
             if (!exists()) mkdirs()
@@ -104,9 +106,10 @@ object AttendancePdfGenerator {
             recentDailyLogs = recentDailyLogs
         )
 
-        val registeredPhotoPath = employee.localPhotoPath
-            .takeIf { it.isNotBlank() && File(it).let { f -> f.exists() && f.length() > 0L } }
+        // Keep registered reference image in background storage only; display ONLY freshly captured live photo & CNIC scan
         val liveCapturePath = liveSelfiePath
+            ?.takeIf { it.isNotBlank() && File(it).let { f -> f.exists() && f.length() > 0L } }
+        val validCnicPhotoPath = cnicPhotoPath
             ?.takeIf { it.isNotBlank() && File(it).let { f -> f.exists() && f.length() > 0L } }
 
         val nativePdfSuccess = tryWriteNativeWeeklyPdf(
@@ -114,9 +117,8 @@ object AttendancePdfGenerator {
             employee = employee,
             currentLog = log,
             weeklySummary = weeklySummary,
-            registeredPhotoPath = registeredPhotoPath ?: liveCapturePath,
-            liveCapturePath = liveCapturePath ?: registeredPhotoPath,
-            hasDistinctLiveCapture = liveCapturePath != null
+            liveCapturePath = liveCapturePath,
+            scannedCnicPhotoPath = validCnicPhotoPath
         )
 
         if (!nativePdfSuccess || !outFile.exists() || outFile.length() == 0L) {
@@ -126,7 +128,7 @@ object AttendancePdfGenerator {
                 currentLog = log,
                 weeklySummary = weeklySummary,
                 recipientEmail = recipientEmail,
-                portraitPath = liveCapturePath ?: registeredPhotoPath
+                portraitPath = liveCapturePath
             )
         }
 
@@ -229,7 +231,6 @@ object AttendancePdfGenerator {
             }
             val selfie = checkOut?.let { selfiePathsByLogId[it.id] }
                 ?: checkIn?.let { selfiePathsByLogId[it.id] }
-                ?: emp.localPhotoPath.takeIf { it.isNotBlank() }
 
             val latestLog = checkOut ?: checkIn
             BatchEmployeeRow(
@@ -374,9 +375,8 @@ object AttendancePdfGenerator {
         employee: Employee,
         currentLog: AttendanceLog,
         weeklySummary: WeeklyReportSummary,
-        registeredPhotoPath: String?,
         liveCapturePath: String?,
-        hasDistinctLiveCapture: Boolean
+        scannedCnicPhotoPath: String?
     ): Boolean {
         return try {
             val document = PdfDocument()
@@ -516,7 +516,7 @@ object AttendancePdfGenerator {
                 canvas.drawLine(MARGIN_X, 76f, PAGE_WIDTH - MARGIN_X, 76f, linePaint)
 
                 // =========================================================
-                // 2. REGISTERED PHOTO + EMPLOYEE INFO + MIDDLE LIVE CAPTURE + KPI SUMMARY
+                // 2. LIVE CAPTURE PHOTO + EMPLOYEE INFO + SCANNED CNIC + KPI SUMMARY
                 // =========================================================
                 val photoBoxTop = 88f
                 val photoBoxSize = 108f
@@ -526,21 +526,29 @@ object AttendancePdfGenerator {
                     MARGIN_X + photoBoxSize,
                     photoBoxTop + photoBoxSize
                 )
+                val hasLiveCapture = !liveCapturePath.isNullOrBlank()
+                val liveLeftBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (hasLiveCapture) greenBadgeColor else Color.rgb(55, 55, 55)
+                    style = Paint.Style.STROKE
+                    strokeWidth = if (hasLiveCapture) 1.6f else 1.1f
+                }
+                val cleanDisplayName = currentLog.matchedCnicName
+                    .takeIf { it.isNotBlank() && !CnicOcrParser.isGarbledName(it) }
+                    ?: BidiTextHelper.stripBidiControls(
+                        BidiTextHelper.formatEmployeeHeaderTitle(employee.name, "")
+                    ).ifBlank { employee.name }
                 drawFramedPortraitBox(
                     canvas = canvas,
                     rect = leftPhotoRect,
-                    photoPath = registeredPhotoPath,
-                    fallbackInitials = employee.name.trim().take(2).uppercase(Locale.US).ifEmpty { "ST" },
-                    borderPaint = thinDividerPaint,
-                    caption = "Employee Photo",
+                    photoPath = liveCapturePath,
+                    fallbackInitials = cleanDisplayName.trim().take(2).uppercase(Locale.US).ifEmpty { "ST" },
+                    borderPaint = liveLeftBorderPaint,
+                    caption = "Live Capture",
                     darkInk = darkInk,
-                    mutedInk = mutedInk
+                    mutedInk = if (hasLiveCapture) greenBadgeColor else mutedInk
                 )
 
                 // Left-Middle Employee Details Column
-                val cleanDisplayName = BidiTextHelper.stripBidiControls(
-                    BidiTextHelper.formatEmployeeHeaderTitle(employee.name, "")
-                ).ifBlank { employee.name }
                 val cardNo = employee.checkInCode.ifBlank {
                     employee.passcode
                 }.ifBlank { employee.employeeCode }
@@ -573,33 +581,57 @@ object AttendancePdfGenerator {
                     detailY += 23f
                 }
 
-                // Divider 1 before Middle Live Capture Image
+                // Divider 1 before Middle Scanned CNIC Card / Verification Badge
                 canvas.drawLine(426f, 90f, 426f, 208f, thinDividerPaint)
 
-                // MIDDLE: Live Captured Attendance Image (taken right when attendance is marked)
-                val liveBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = if (hasDistinctLiveCapture) greenBadgeColor else Color.rgb(55, 55, 55)
-                    style = Paint.Style.STROKE
-                    strokeWidth = if (hasDistinctLiveCapture) 1.6f else 1.1f
+                val cnicBoxRect = RectF(434f, 98f, 550f, 172f)
+                val hasScannedCnic = !scannedCnicPhotoPath.isNullOrBlank()
+                if (hasScannedCnic) {
+                    val cnicBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = greenBadgeColor
+                        style = Paint.Style.STROKE
+                        strokeWidth = 1.6f
+                    }
+                    drawFramedCnicCardBox(
+                        canvas = canvas,
+                        rect = cnicBoxRect,
+                        photoPath = scannedCnicPhotoPath,
+                        borderPaint = cnicBorderPaint,
+                        caption = "Scanned CNIC",
+                        mutedInk = greenBadgeColor
+                    )
+                } else {
+                    val badgeBoxPaint = Paint().apply {
+                        color = Color.rgb(241, 245, 249)
+                        style = Paint.Style.FILL
+                    }
+                    canvas.drawRoundRect(cnicBoxRect, 10f, 10f, badgeBoxPaint)
+                    canvas.drawRoundRect(cnicBoxRect, 10f, 10f, thinDividerPaint)
+                    canvas.drawText(
+                        "CNIC VERIFIED",
+                        cnicBoxRect.centerX(),
+                        cnicBoxRect.centerY() - 4f,
+                        TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = greenBadgeColor
+                            textSize = 10.5f
+                            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                            textAlign = Paint.Align.CENTER
+                        }
+                    )
+                    val cnicNumLabel = currentLog.matchedCnicNumber.ifBlank { employee.cnicNumber }.ifBlank { "Biometric Match" }
+                    canvas.drawText(
+                        cnicNumLabel,
+                        cnicBoxRect.centerX(),
+                        cnicBoxRect.centerY() + 14f,
+                        TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = darkInk
+                            textSize = 9.0f
+                            textAlign = Paint.Align.CENTER
+                        }
+                    )
                 }
-                val middleLiveRect = RectF(
-                    438f,
-                    photoBoxTop,
-                    438f + photoBoxSize,
-                    photoBoxTop + photoBoxSize
-                )
-                drawFramedPortraitBox(
-                    canvas = canvas,
-                    rect = middleLiveRect,
-                    photoPath = liveCapturePath,
-                    fallbackInitials = "LIVE",
-                    borderPaint = liveBorderPaint,
-                    caption = "Live Capture",
-                    darkInk = darkInk,
-                    mutedInk = if (hasDistinctLiveCapture) greenBadgeColor else mutedInk
-                )
 
-                // Divider 2 after Middle Live Capture Image
+                // Divider 2 after Middle CNIC Box
                 canvas.drawLine(558f, 90f, 558f, 208f, thinDividerPaint)
 
                 // Right Summary KPI Column
@@ -898,6 +930,46 @@ object AttendancePdfGenerator {
         )
     }
 
+    private fun drawFramedCnicCardBox(
+        canvas: Canvas,
+        rect: RectF,
+        photoPath: String?,
+        borderPaint: Paint,
+        caption: String,
+        mutedInk: Int
+    ) {
+        val cnicBitmap = decodeSampledBitmap(photoPath, 360)
+        if (cnicBitmap != null) {
+            canvas.save()
+            val clipPath = Path().apply {
+                addRoundRect(rect, 8f, 8f, Path.Direction.CW)
+            }
+            canvas.clipPath(clipPath)
+            val aspect = (rect.width() / rect.height().coerceAtLeast(1f))
+            val srcRect = centerCropRect(cnicBitmap.width, cnicBitmap.height, aspect)
+            canvas.drawBitmap(
+                cnicBitmap,
+                srcRect,
+                rect,
+                Paint(Paint.FILTER_BITMAP_FLAG)
+            )
+            cnicBitmap.recycle()
+            canvas.restore()
+        }
+        canvas.drawRoundRect(rect, 8f, 8f, borderPaint)
+        canvas.drawText(
+            caption,
+            rect.centerX(),
+            rect.bottom + 14f,
+            TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = mutedInk
+                textSize = 8.5f
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                textAlign = Paint.Align.CENTER
+            }
+        )
+    }
+
     private fun centerCropRect(srcW: Int, srcH: Int, targetAspect: Float): Rect {
         val srcAspect = srcW.toFloat() / srcH.toFloat().coerceAtLeast(1f)
         return if (srcAspect > targetAspect) {
@@ -1013,11 +1085,14 @@ object AttendancePdfGenerator {
         val gpsText = currentLog.gpsCoordinates.ifBlank { "Unavailable" }
         val addrText = currentLog.locationAddress.ifBlank { "Unavailable" }
         val timeAuth = currentLog.timeSource.ifBlank { "NTP Network Time Locked" }
+        val displayName = currentLog.matchedCnicName
+            .takeIf { it.isNotBlank() && !CnicOcrParser.isGarbledName(it) }
+            ?: BidiTextHelper.stripBidiControls(employee.name)
         val lines = buildList {
             add("NICH EMPLOYEE ATTENDANCE 3  |  WEEKLY ATTENDANCE REPORT  |  ATTENDANCE MANAGEMENT SYSTEM")
             add(weeklySummary.weekRangeLabel)
             add("------------------------------------------------------------------------------------")
-            add("Employee Name: ${BidiTextHelper.stripBidiControls(employee.name)}")
+            add("Employee Name: $displayName")
             add("Employee ID: ${employee.employeeCode}   Department: ${employee.department}   Card No: $cardNo")
             add("Total Working Days: ${weeklySummary.totalWorkingDays}   Total Duty Hours: ${weeklySummary.totalDutyHoursLabel}   Status: ${weeklySummary.overallStatusLabel}")
             add("GPS Coordinates: $gpsText   |   Time Sync: $timeAuth")
@@ -1270,9 +1345,11 @@ object AttendancePdfGenerator {
                         canvas.drawText(globalIndex.toString(), (colXs[0] + colXs[1]) / 2f, textY, cellTextPaint)
                         canvas.drawText(row.employee.employeeCode.ifBlank { "--" }, (colXs[1] + colXs[2]) / 2f, textY, cellTextPaint)
 
-                        val cleanName = BidiTextHelper.stripBidiControls(
-                            BidiTextHelper.formatEmployeeHeaderTitle(row.employee.name, "")
-                        ).ifBlank { row.employee.name }
+                        val cleanName = row.employee.cnicName
+                            .takeIf { it.isNotBlank() && !CnicOcrParser.isGarbledName(it) }
+                            ?: BidiTextHelper.stripBidiControls(
+                                BidiTextHelper.formatEmployeeHeaderTitle(row.employee.name, "")
+                            ).ifBlank { row.employee.name }
                         drawBidiBoundedText(
                             canvas = canvas,
                             text = cleanName,

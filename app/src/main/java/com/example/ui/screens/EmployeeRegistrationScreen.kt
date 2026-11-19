@@ -363,14 +363,17 @@ fun EmployeeRegistrationScreen(
                 employeeIndex = captureTargetIndex + 1,
                 onCaptured = { capturedPath, capturedSignature, capturedCnicPath, cnicNumber, cnicName ->
                     val currentDraft = drafts[captureTargetIndex]
-                    val resolvedName = currentDraft.name.ifBlank { cnicName }
+                    val validCnicName = cnicName.trim()
+                        .takeUnless { com.example.data.model.CnicOcrParser.isGarbledName(it) }
+                        .orEmpty()
+                    val resolvedName = currentDraft.name.ifBlank { validCnicName }
                     drafts[captureTargetIndex] = currentDraft.copy(
                         name = resolvedName,
                         photoPath = capturedPath,
                         faceSignature = capturedSignature,
                         cnicPhotoPath = capturedCnicPath,
                         cnicNumber = cnicNumber,
-                        cnicName = cnicName.ifBlank { resolvedName }
+                        cnicName = validCnicName.ifBlank { resolvedName }
                     )
                     activeCaptureDraftIndex = null
                 },

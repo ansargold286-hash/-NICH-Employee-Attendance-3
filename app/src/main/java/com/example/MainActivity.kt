@@ -10,16 +10,23 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -30,6 +37,10 @@ import com.example.data.remote.ServerSyncClient
 import com.example.data.report.AttendanceEmailReporter
 import com.example.data.repository.AttendanceRepository
 import com.example.data.time.SntpNetworkTimeProvider
+import com.example.data.update.GithubUpdateManager
+import com.example.data.update.VersionMetadata
+import com.example.ui.components.AppUpdateDialog
+import com.example.ui.components.AppUpdateUiState
 import com.example.ui.screens.EmployeeRegistrationScreen
 import com.example.ui.screens.StartupPermissionGateScreen
 import com.example.ui.screens.TerminalDashboardScreen
@@ -50,6 +61,7 @@ import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -160,17 +172,89 @@ private fun StrictBiometricTerminalShell(
     )
 
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     val terminalPhase by viewModel.terminalPhase.collectAsStateWithLifecycle()
     val showRegistration by viewModel.showRegistrationScreen.collectAsStateWithLifecycle()
     val networkTimeStatus by viewModel.networkTimeStatus.collectAsStateWithLifecycle()
     val employeesUi by viewModel.employeesState.collectAsStateWithLifecycle()
     val employeesList = (employeesUi as? DataUiState.Success)?.data.orEmpty()
 
+    val updateManager = remember(context) { GithubUpdateManager(context) }
+    var updateUiState by remember { mutableStateOf<AppUpdateUiState>(AppUpdateUiState.Hidden) }
+
+    fun launchApkInstaller(apkFile: java.io.File) {
+        runCatching {
+            context.startActivity(updateManager.buildInstallApkIntent(apkFile))
+        }
+    }
+
+    fun startUpdateDownload(metadata: VersionMetadata) {
+        coroutineScope.launch {
+            updateUiState = AppUpdateUiState.Downloading(
+                metadata = metadata,
+                progressPercent = 0,
+                downloadedBytes = 0L,
+                totalBytes = -1L
+            )
+            val result = updateManager.downloadApk(
+                apkUrl = metadata.apkUrl,
+                versionName = metadata.latestVersionName
+            ) { percent, downloaded, total ->
+                updateUiState = AppUpdateUiState.Downloading(
+                    metadata = metadata,
+                    progressPercent = percent,
+                    downloadedBytes = downloaded,
+                    totalBytes = total
+                )
+            }
+            result.onSuccess { apkFile ->
+                if (updateManager.canInstallPackages()) {
+                    updateUiState = AppUpdateUiState.ReadyToInstall(metadata, apkFile)
+                    launchApkInstaller(apkFile)
+                } else {
+                    updateUiState = AppUpdateUiState.NeedsInstallPermission(metadata, apkFile)
+                }
+            }.onFailure { err ->
+                updateUiState = AppUpdateUiState.Error(
+                    metadata = metadata,
+                    message = err.localizedMessage ?: "Failed to download APK update."
+                )
+            }
+        }
+    }
+
+    // Check GitHub version.json silently on startup without interrupting scanning
+    LaunchedEffect(updateManager) {
+        val available = updateManager.checkForUpdate()
+        if (available != null) {
+            updateUiState = AppUpdateUiState.Available(available)
+        }
+    }
+
+    // Automatically resume APK install when returning from Unknown App Sources settings
+    DisposableEffect(lifecycleOwner, updateUiState) {
+        val observer = LifecycleEventObserver { _, event ->
+            val current = updateUiState
+            if (event == Lifecycle.Event.ON_RESUME &&
+                current is AppUpdateUiState.NeedsInstallPermission &&
+                updateManager.canInstallPackages()
+            ) {
+                updateUiState = AppUpdateUiState.ReadyToInstall(current.metadata, current.apkFile)
+                launchApkInstaller(current.apkFile)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Scaffold(
         modifier = Modifier
             .fillMaxSize()
             .background(ObsidianVoid),
         containerColor = ObsidianVoid,
+        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { innerPadding ->
         Box(
@@ -201,9 +285,42 @@ private fun StrictBiometricTerminalShell(
                     onAttemptSkipCheckOutEmail = viewModel::attemptSkipOrDismissCheckOut,
                     networkTimeLabel = networkTimeStatus.sourceLabel,
                     onCnicFrameAnalyzed = viewModel::onCnicFrameAnalyzed,
-                    onCancelCnicScan = viewModel::cancelCnicStepToFaceScan
+                    onCancelCnicScan = viewModel::cancelCnicStepToFaceScan,
+                    onCheckUpdatesClick = {
+                        coroutineScope.launch {
+                            val available = updateManager.checkForUpdate()
+                            if (available != null) {
+                                updateUiState = AppUpdateUiState.Available(available)
+                            } else {
+                                snackbarHostState.showSnackbar(
+                                    "You are running the latest version (v${BuildConfig.VERSION_NAME})."
+                                )
+                            }
+                        }
+                    }
                 )
             }
         }
     }
+
+    AppUpdateDialog(
+        state = updateUiState,
+        onDownloadUpdate = { metadata -> startUpdateDownload(metadata) },
+        onRequestInstallPermission = {
+            runCatching {
+                context.startActivity(updateManager.buildUnknownAppSourcesIntent())
+            }
+        },
+        onInstallDownloadedApk = { apkFile ->
+            if (updateManager.canInstallPackages()) {
+                launchApkInstaller(apkFile)
+            } else {
+                val meta = (updateUiState as? AppUpdateUiState.ReadyToInstall)?.metadata
+                if (meta != null) {
+                    updateUiState = AppUpdateUiState.NeedsInstallPermission(meta, apkFile)
+                }
+            }
+        },
+        onDismiss = { updateUiState = AppUpdateUiState.Hidden }
+    )
 }

@@ -45,7 +45,7 @@ jobs:
           fi
           keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey
 
-      - name: Ensure Secrets Gradle .env exists
+      - name: Ensure Secrets Gradle .env exists & bind repository update URL
         run: |
           if [ ! -f .env ]; then
             if [ -f .env.example ]; then
@@ -53,6 +53,11 @@ jobs:
             else
               printf 'SMTP_EMAIL=Nichemployeeattendance@gmail.com\nSMTP_APP_PASSWORD=MY_GMAIL_APP_PASSWORD\n' > .env
             fi
+          fi
+          DEFAULT_VERSION_JSON_URL="https://github.com/${{ github.repository }}/releases/download/latest-apk/version.json"
+          UPDATE_CHECKER_FILE="app/src/main/java/com/example/data/update/GithubUpdateChecker.kt"
+          if [ -f "$UPDATE_CHECKER_FILE" ] && grep -q 'nich-attendance/nich-attendance-3' "$UPDATE_CHECKER_FILE"; then
+            sed -i "s|https://github.com/nich-attendance/nich-attendance-3/releases/download/latest-apk/version.json|${DEFAULT_VERSION_JSON_URL}|g" "$UPDATE_CHECKER_FILE"
           fi
 
       - name: Prepare Firebase google-services.json
@@ -96,6 +101,7 @@ jobs:
           "$BUILD_TOOLS_DIR/aapt2" dump badging "$APK_SRC" | head -n 10
           unzip -tq "$APK_SRC"
 
+          VERSION_CODE="$(grep -m1 'versionCode' app/build.gradle.kts | sed -E 's/.*=[[:space:]]*([0-9]+).*/\1/' || echo '2')"
           VERSION_NAME="$(grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/' || echo '2.0')"
           APK_NAME="NICH-Attendance-3-v${VERSION_NAME}-debug.apk"
           ZIP_NAME="NICH-Attendance-3-v${VERSION_NAME}-debug-apk.zip"
@@ -108,9 +114,19 @@ jobs:
           # so built-in Android & Windows extractors open it cleanly without corruption errors.
           zip -j -6 "dist/$ZIP_NAME" "dist/$APK_NAME"
           unzip -tq "dist/$ZIP_NAME"
+
+          cat > dist/version.json <<EOF
+{
+  "latestVersionCode": ${VERSION_CODE},
+  "latestVersionName": "${VERSION_NAME}",
+  "apkUrl": "https://github.com/${{ github.repository }}/releases/download/latest-apk/${APK_NAME}",
+  "releaseNotes": "NICH Employee Attendance 3 v${VERSION_NAME} (Build ${VERSION_CODE})"
+}
+EOF
           ls -lh dist/
 
           {
+            echo "VERSION_CODE=$VERSION_CODE"
             echo "VERSION_NAME=$VERSION_NAME"
             echo "APK_NAME=$APK_NAME"
             echo "ZIP_NAME=$ZIP_NAME"
@@ -120,6 +136,7 @@ jobs:
             printf '## NICH Employee Attendance 3 v%s\n\n' "$VERSION_NAME"
             printf -- '- **Direct Android Install (Recommended):** Download `%s` directly and tap to install (no ZIP extraction needed).\n' "$APK_NAME"
             printf -- '- **Standard ZIP Archive:** `%s` is verified with `unzip -tq` (standard PKZIP format compatible with Android My Files / Files by Google / Windows Explorer).\n' "$ZIP_NAME"
+            printf -- '- **In-App Auto-Update:** `version.json` published automatically for seamless in-app upgrades.\n'
             printf -- '- **Verified:** `apksigner verify`, `zipalign`, and `aapt2 dump badging` all passed.\n'
             printf -- '- If Android shows *"App not installed / package conflicts"*, uninstall any older build signed with a different key once before installing.\n'
           } > dist/RELEASE_NOTES.md
@@ -139,12 +156,12 @@ jobs:
         run: |
           TAG="latest-apk"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "dist/${{ env.APK_NAME }}" "dist/${{ env.ZIP_NAME }}" --clobber
+            gh release upload "$TAG" "dist/${{ env.APK_NAME }}" "dist/${{ env.ZIP_NAME }}" "dist/version.json" --clobber
             gh release edit "$TAG" \
               --title "NICH Employee Attendance 3 v${{ env.VERSION_NAME }} (Direct APK)" \
               --notes-file dist/RELEASE_NOTES.md
           else
-            gh release create "$TAG" "dist/${{ env.APK_NAME }}" "dist/${{ env.ZIP_NAME }}" \
+            gh release create "$TAG" "dist/${{ env.APK_NAME }}" "dist/${{ env.ZIP_NAME }}" "dist/version.json" \
               --title "NICH Employee Attendance 3 v${{ env.VERSION_NAME }} (Direct APK)" \
               --notes-file dist/RELEASE_NOTES.md
           fi

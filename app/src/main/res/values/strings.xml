@@ -30,4 +30,13 @@
     <string name="cnic_green_frame_hint">Hold CNIC Front Side inside the Green Guide Frame (Auto-Snap)</string>
     <string name="batch_waiting_others_hint">All staff must complete Check-In &amp; Check-Out before sending the batch email.</string>
     <string name="send_batch_email_and_finish">Send Batch PDF Email &amp; Finish</string>
+    <string name="app_update_available_title">نئی اپڈیٹ آ گئی ہے! براہ کرم ایپ اپڈیٹ کریں (New update available — please update the app)</string>
+    <string name="app_update_keeps_data_note">All local employee faces, CNICs &amp; attendance records stay safely preserved.</string>
+    <string name="downloading_update">Downloading APK update...</string>
+    <string name="download_update_button">Download Update</string>
+    <string name="allow_app_installs_button">Allow Install Permission</string>
+    <string name="install_update_now_button">Install Update Now</string>
+    <string name="update_later_button">Later</string>
+    <string name="install_permission_required_note">Please allow \"Install unknown apps\" for NICH Employee Attendance 3 so the downloaded APK can install.</string>
+    <string name="update_ready_to_install_note">APK downloaded cleanly. Tap Install Update Now if the installer did not open automatically.</string>
 </resources>

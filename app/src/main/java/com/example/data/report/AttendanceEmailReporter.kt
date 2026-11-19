@@ -8,6 +8,7 @@ import androidx.core.content.FileProvider
 import com.example.BuildConfig
 import com.example.data.model.AttendanceEventType
 import com.example.data.model.AttendanceLog
+import com.example.data.model.CnicOcrParser
 import com.example.data.model.Employee
 import com.example.data.model.VerificationMethod
 import kotlinx.coroutines.Dispatchers
@@ -65,7 +66,8 @@ class AttendanceEmailReporter(
         confidenceScore: Int,
         syncedToCloud: Boolean,
         recentDailyLogs: List<AttendanceLog>,
-        liveSelfiePath: String? = null
+        liveSelfiePath: String? = null,
+        cnicPhotoPath: String? = null
     ): File = withContext(Dispatchers.IO) {
         val recipient = resolveRecipientEmail()
         val pdfFile = AttendancePdfGenerator.generateReportPdf(
@@ -78,7 +80,8 @@ class AttendanceEmailReporter(
             syncedToCloud = syncedToCloud,
             recentDailyLogs = recentDailyLogs,
             recipientEmail = recipient,
-            liveSelfiePath = liveSelfiePath
+            liveSelfiePath = liveSelfiePath,
+            cnicPhotoPath = cnicPhotoPath
         )
         pruneOldCachedReports(pdfFile)
         pdfFile
@@ -92,7 +95,8 @@ class AttendanceEmailReporter(
         confidenceScore: Int,
         syncedToCloud: Boolean,
         recentDailyLogs: List<AttendanceLog>,
-        liveSelfiePath: String? = null
+        liveSelfiePath: String? = null,
+        cnicPhotoPath: String? = null
     ): EmailReportStatus = withContext(Dispatchers.IO) {
         val pdfFile = try {
             generateReportPdfFile(
@@ -103,7 +107,8 @@ class AttendanceEmailReporter(
                 confidenceScore = confidenceScore,
                 syncedToCloud = syncedToCloud,
                 recentDailyLogs = recentDailyLogs,
-                liveSelfiePath = liveSelfiePath
+                liveSelfiePath = liveSelfiePath,
+                cnicPhotoPath = cnicPhotoPath
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to generate attendance PDF report", e)
@@ -118,7 +123,10 @@ class AttendanceEmailReporter(
             return@withContext EmailReportStatus.NEEDS_CONFIG
         }
 
-        val subject = buildSubject(eventType, employee)
+        val displayName = log.matchedCnicName
+            .takeIf { it.isNotBlank() && !CnicOcrParser.isGarbledName(it) }
+            ?: employee.name
+        val subject = buildSubject(eventType, employee, displayName)
         val body = buildPlainTextBody(
             employee = employee,
             log = log,
@@ -170,7 +178,10 @@ class AttendanceEmailReporter(
             pdfFile
         )
 
-        val subject = buildSubject(eventType, employee)
+        val displayName = log.matchedCnicName
+            .takeIf { it.isNotBlank() && !CnicOcrParser.isGarbledName(it) }
+            ?: employee.name
+        val subject = buildSubject(eventType, employee, displayName)
         val body = buildPlainTextBody(
             employee = employee,
             log = log,
@@ -331,8 +342,12 @@ class AttendanceEmailReporter(
         }
     }
 
-    private fun buildSubject(eventType: AttendanceEventType, employee: Employee): String {
-        return "NICH Employee Attendance 3 • ${eventType.displayLabel} • ${employee.name} (${employee.employeeCode})"
+    private fun buildSubject(
+        eventType: AttendanceEventType,
+        employee: Employee,
+        displayName: String = employee.name
+    ): String {
+        return "NICH Employee Attendance 3 • ${eventType.displayLabel} • $displayName (${employee.employeeCode})"
     }
 
     private fun buildBatchSubject(dateKey: String, employeeCount: Int): String {
@@ -348,10 +363,13 @@ class AttendanceEmailReporter(
         syncedToCloud: Boolean,
         deviceAccountEmail: String?
     ): String {
+        val displayName = log.matchedCnicName
+            .takeIf { it.isNotBlank() && !CnicOcrParser.isGarbledName(it) }
+            ?: employee.name
         return buildString {
             appendLine("NICH Employee Attendance 3 — Automated Attendance Report")
             appendLine("==========================================================")
-            appendLine("Employee Name: ${employee.name}")
+            appendLine("Employee Name: $displayName")
             appendLine("Employee ID: ${employee.employeeCode}")
             appendLine("Department: ${employee.department}")
             appendLine("Role: ${employee.roleTitle}")

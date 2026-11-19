@@ -327,6 +327,14 @@ class AttendanceViewModel(
         val batchCount = lock.batchEmployeeCount.coerceAtLeast(1)
         val batchDate = lock.batchDateKey.ifBlank { lock.loggedDateKey }
 
+        val restoredCnicName = CnicOcrParser.resolveVerifiedDisplayName(
+            observedName = lock.matchedCnicName,
+            employee = matchedEmployee
+        )
+        val restoredCnicPhotoPath = lock.cnicPhotoPath
+            .ifBlank { matchedEmployee.cnicPhotoPath }
+            .ifBlank { null }
+
         _terminalPhase.value = TerminalUiPhase.Verified(
             employee = matchedEmployee,
             eventType = AttendanceEventType.CHECK_OUT,
@@ -346,9 +354,9 @@ class AttendanceViewModel(
             emailEnforcementWarningActive = true,
             emailEnforcementMessage = VoicePromptScript.PENDING_CHECKOUT_LOCK_PROMPT,
             checkOutEmailTriggeredOrSent = false,
-            matchedCnicName = matchedEmployee.cnicName.ifBlank { matchedEmployee.name },
+            matchedCnicName = restoredCnicName,
             matchedCnicNumber = matchedEmployee.cnicNumber,
-            cnicPhotoPath = matchedEmployee.cnicPhotoPath.ifBlank { null },
+            cnicPhotoPath = restoredCnicPhotoPath,
             isBatchMode = lock.isConsolidatedBatch,
             batchCompletedCount = batchCount,
             batchTotalCount = batchCount,
@@ -523,6 +531,9 @@ class AttendanceViewModel(
                     syncedToCloud = log.id !in pendingCloudIds
                 )
             } else {
+                val cnicPath = activeLock?.takeIf { it.logId == logId }?.cnicPhotoPath
+                    ?.ifBlank { employee.cnicPhotoPath }
+                    ?: employee.cnicPhotoPath.ifBlank { null }
                 reporter.generateAndSendReport(
                     employee = employee,
                     log = log,
@@ -531,7 +542,8 @@ class AttendanceViewModel(
                     confidenceScore = log.confidenceScore.toInt(),
                     syncedToCloud = log.id !in pendingCloudIds,
                     recentDailyLogs = recentLogs,
-                    liveSelfiePath = selfieMap[log.id]
+                    liveSelfiePath = selfieMap[log.id],
+                    cnicPhotoPath = cnicPath?.ifBlank { null }
                 )
             }
             if (outcome == EmailReportStatus.SENT) {
@@ -981,11 +993,16 @@ class AttendanceViewModel(
 
         val outcome = CnicOcrParser.verifyAgainstEmployee(frame, current.employee)
         val displayCnicNum = outcome.matchedCnicNumber.ifBlank { frame.cnicNumber }
-        val displayCnicName = outcome.matchedName.ifBlank { frame.extractedName }
+        val displayCnicName = outcome.matchedName
+            .takeUnless { CnicOcrParser.isGarbledName(it) }
+            ?: frame.extractedName.takeUnless { CnicOcrParser.isGarbledName(it) }.orEmpty()
 
         if (frame.cardDetected && frame.insideGreenFrame && outcome.matched) {
             cnicCommitInFlight = true
-            val resolvedName = displayCnicName.ifBlank { current.employee.cnicName.ifBlank { current.employee.name } }
+            val resolvedName = CnicOcrParser.resolveVerifiedDisplayName(
+                observedName = displayCnicName,
+                employee = current.employee
+            )
             val resolvedCnicNumber = displayCnicNum.ifBlank { current.employee.cnicNumber }
             _terminalPhase.update { phase ->
                 if (phase is TerminalUiPhase.CnicScanning) {
@@ -1077,6 +1094,12 @@ class AttendanceViewModel(
         val readableAddr = locationSnapshot?.readableAddress.orEmpty()
         val timeSourceLabel = networkSnapshot.sourceLabel
 
+        val resolvedCnicDisplayName = CnicOcrParser.resolveVerifiedDisplayName(
+            observedName = matchedCnicName,
+            employee = employee
+        )
+        val resolvedCnicNumber = matchedCnicNumber.ifBlank { employee.cnicNumber }
+
         lastVerifiedEmployeeId = employee.id
         lastVerifiedTimestampMs = System.currentTimeMillis()
 
@@ -1092,8 +1115,8 @@ class AttendanceViewModel(
             gpsCoordinates = gpsCoords,
             locationAddress = readableAddr,
             timeSource = timeSourceLabel,
-            matchedCnicName = matchedCnicName,
-            matchedCnicNumber = matchedCnicNumber
+            matchedCnicName = resolvedCnicDisplayName,
+            matchedCnicNumber = resolvedCnicNumber
         )
         val durableSelfiePath = offlineStore.persistSelfieForLog(localEntry.id, liveSelfiePath)
             ?: liveSelfiePath
@@ -1143,8 +1166,8 @@ class AttendanceViewModel(
             emailEnforcementWarningActive = false,
             emailEnforcementMessage = null,
             checkOutEmailTriggeredOrSent = !isReadyToDispatchEmail,
-            matchedCnicName = matchedCnicName,
-            matchedCnicNumber = matchedCnicNumber,
+            matchedCnicName = resolvedCnicDisplayName,
+            matchedCnicNumber = resolvedCnicNumber,
             cnicPhotoPath = durableCnicPath,
             isBatchMode = isBatchMode,
             batchCompletedCount = if (isBatchMode) batchStatus.completedCount else 1,
@@ -1156,7 +1179,7 @@ class AttendanceViewModel(
 
         voiceSpeaker.speak(
             VoicePromptScript.verificationPrompt(
-                employeeName = employee.name,
+                employeeName = resolvedCnicDisplayName,
                 eventType = eventType,
                 isBatchWaitingOthers = isWaitingOthersInBatch
             ),
@@ -1212,7 +1235,7 @@ class AttendanceViewModel(
                     logId = localEntry.id,
                     employeeId = employee.id,
                     employeeCode = employee.employeeCode,
-                    employeeName = employee.name,
+                    employeeName = resolvedCnicDisplayName,
                     department = employee.department,
                     roleTitle = employee.roleTitle,
                     avatarKey = employee.avatarKey,
@@ -1227,7 +1250,9 @@ class AttendanceViewModel(
                     liveSelfiePath = durableSelfiePath.orEmpty(),
                     isConsolidatedBatch = isBatchMode,
                     batchDateKey = if (isBatchMode) dateKey else "",
-                    batchEmployeeCount = totalEnrolled
+                    batchEmployeeCount = totalEnrolled,
+                    matchedCnicName = resolvedCnicDisplayName,
+                    cnicPhotoPath = durableCnicPath.orEmpty()
                 )
             )
             val reporter = emailReporter
@@ -1256,6 +1281,7 @@ class AttendanceViewModel(
                         confidence = confidence,
                         syncedToCloud = false,
                         liveSelfiePath = durableSelfiePath,
+                        cnicPhotoPath = durableCnicPath,
                         rescheduleResetAfter = false
                     )
                 }
@@ -1286,7 +1312,8 @@ class AttendanceViewModel(
                                     confidenceScore = confidence,
                                     syncedToCloud = false,
                                     recentDailyLogs = recentLogsSnapshot,
-                                    liveSelfiePath = durableSelfiePath
+                                    liveSelfiePath = durableSelfiePath,
+                                    cnicPhotoPath = durableCnicPath
                                 )
                             }
                         }.onSuccess { pdfFile ->
@@ -1444,7 +1471,8 @@ class AttendanceViewModel(
                             confidenceScore = current.confidenceScore,
                             syncedToCloud = current.syncedToCloud,
                             recentDailyLogs = snapshotLogs,
-                            liveSelfiePath = current.liveSelfiePath
+                            liveSelfiePath = current.liveSelfiePath,
+                            cnicPhotoPath = current.cnicPhotoPath
                         )
                     }
                     recordServerEmailEvent(
@@ -1493,7 +1521,8 @@ class AttendanceViewModel(
                                 confidenceScore = current.confidenceScore,
                                 syncedToCloud = current.syncedToCloud,
                                 recentDailyLogs = snapshotLogs,
-                                liveSelfiePath = current.liveSelfiePath
+                                liveSelfiePath = current.liveSelfiePath,
+                                cnicPhotoPath = current.cnicPhotoPath
                             )
                         }
                         offlineStore.updatePendingCheckOutPdfPath(matchingLog.id, pdfFile.absolutePath)
@@ -1525,7 +1554,7 @@ class AttendanceViewModel(
                         onLaunchEmailIntent(gmailIntent)
                         openedDeviceShare = true
                     }.onFailure { err ->
-                        Log.w(TAG, "Email intent preparation deferred: ${err.message}")
+                        Log.w(TAG, "Email intent preparation deferred: ${err.message}", err)
                     }
                     _terminalPhase.update { phase ->
                         if (phase is TerminalUiPhase.Verified && phase.logId == current.logId) {
@@ -1627,6 +1656,7 @@ class AttendanceViewModel(
             confidence = current.confidenceScore,
             syncedToCloud = current.syncedToCloud,
             liveSelfiePath = current.liveSelfiePath,
+            cnicPhotoPath = current.cnicPhotoPath,
             rescheduleResetAfter = true
         )
     }
@@ -1637,7 +1667,7 @@ class AttendanceViewModel(
                 id = current.logId.ifBlank { "manual_${System.currentTimeMillis()}" },
                 employeeId = current.employee.id,
                 employeeCode = current.employee.employeeCode,
-                employeeName = current.employee.name,
+                employeeName = current.matchedCnicName.ifBlank { current.employee.name },
                 department = current.employee.department,
                 avatarKey = current.employee.avatarKey,
                 eventType = current.eventType.wireValue,
@@ -1647,7 +1677,9 @@ class AttendanceViewModel(
                 loggedDateKey = AttendanceTimeRules.formatDateKey(activeTimeProvider.currentCalendar()),
                 gpsCoordinates = current.gpsCoordinates,
                 locationAddress = current.locationAddress,
-                timeSource = current.timeSourceLabel
+                timeSource = current.timeSourceLabel,
+                matchedCnicName = current.matchedCnicName,
+                matchedCnicNumber = current.matchedCnicNumber
             )
     }
 
@@ -1659,6 +1691,7 @@ class AttendanceViewModel(
         confidence: Int,
         syncedToCloud: Boolean,
         liveSelfiePath: String? = null,
+        cnicPhotoPath: String? = null,
         rescheduleResetAfter: Boolean = false
     ) {
         val reporter = emailReporter ?: return
@@ -1673,7 +1706,8 @@ class AttendanceViewModel(
                 confidenceScore = confidence,
                 syncedToCloud = syncedToCloud,
                 recentDailyLogs = snapshotLogs,
-                liveSelfiePath = liveSelfiePath
+                liveSelfiePath = liveSelfiePath,
+                cnicPhotoPath = cnicPhotoPath
             )
             if (outcome == EmailReportStatus.QUEUED_OFFLINE) {
                 offlineStore.markEmailPending(log.id)
