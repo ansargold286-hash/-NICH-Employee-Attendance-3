@@ -115,14 +115,13 @@ jobs:
           zip -j -6 "dist/$ZIP_NAME" "dist/$APK_NAME"
           unzip -tq "dist/$ZIP_NAME"
 
-          cat > dist/version.json <<EOF
-{
-  "latestVersionCode": ${VERSION_CODE},
-  "latestVersionName": "${VERSION_NAME}",
-  "apkUrl": "https://github.com/${{ github.repository }}/releases/download/latest-apk/${APK_NAME}",
-  "releaseNotes": "NICH Employee Attendance 3 v${VERSION_NAME} (Build ${VERSION_CODE})"
-}
-EOF
+          printf '{\n  "latestVersionCode": %s,\n  "latestVersionName": "%s",\n  "apkUrl": "https://github.com/%s/releases/download/latest-apk/%s",\n  "releaseNotes": "NICH Employee Attendance 3 v%s (Build %s)"\n}\n' \
+            "$VERSION_CODE" \
+            "$VERSION_NAME" \
+            "${{ github.repository }}" \
+            "$APK_NAME" \
+            "$VERSION_NAME" \
+            "$VERSION_CODE" > dist/version.json
           ls -lh dist/
 
           {
